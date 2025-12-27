@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go get:*)",
+      "Bash(go fmt:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__get-library-docs",
+      "WebSearch",
+      "Bash(dir:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go doc:*)",
+      "Bash(go run:*)",
+      "Bash(nul:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
