@@ -13,7 +13,9 @@
       "Bash(go mod tidy:*)",
       "Bash(go doc:*)",
       "Bash(go run:*)",
-      "Bash(nul:*)"
+      "Bash(nul:*)",
+      "Bash(go mod init:*)",
+      "Bash(go mod edit:*)"
     ],
     "deny": [],
     "ask": []
