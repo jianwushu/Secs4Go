@@ -129,8 +129,7 @@ func formatSMLWithIndent(item *Item, indent int) string {
 		for i, child := range children {
 			childParts[i] = formatSMLWithIndent(child, indent+1)
 		}
-		childIndentStr := strings.Repeat("  ", indent+1)
-		return fmt.Sprintf("%s<L[%d]\n%s\n%s>", indentStr, len(children), childIndentStr+strings.Join(childParts, "\n"+childIndentStr), indentStr)
+		return fmt.Sprintf("%s<L[%d]\n%s\n%s>", indentStr, len(children), strings.Join(childParts, "\n"), indentStr)
 
 	case TypeBinary, TypeBoolean:
 		data, ok := item.Value.([]byte)

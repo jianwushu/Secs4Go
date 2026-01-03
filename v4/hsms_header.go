@@ -146,16 +146,3 @@ func (h *HSMSHeader) IsDataMessage() bool {
 func (h *HSMSHeader) IsControlMessage() bool {
 	return !h.IsDataMessage()
 }
-
-// FormatHeader 格式化Header用于日志
-func FormatHeader(h *HSMSHeader) string {
-	if h.IsDataMessage() {
-		return FormatMessage(&Message{
-			Stream:      h.Stream(),
-			Function:    h.Function(),
-			WBit:        h.WBit(),
-			SystemBytes: h.SystemBytes,
-		})
-	}
-	return h.SType.String()
-}

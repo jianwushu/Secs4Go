@@ -70,6 +70,190 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 }
 
 // ============================================================
+// 生命周期管理
+// ============================================================
+
+// Start 启动传输层 (根据 IsActive 自动选择客户端或服务端模式)
+func (t *HSMSTransport) Start() error {
+	if t.config.IsActive {
+		// 客户端模式: 连接并启动后台协程
+		t.logger.Info("Starting transport (active mode)...")
+
+		// 先启动自动重连（确保在 Connect 失败前已就绪）
+		if t.config.AutoReconnect {
+			t.wg.Add(1)
+			go t.autoReconnectLoop()
+		}
+
+		// 连接 (Connect 内部已启动 receiveLoop)
+		if err := t.Connect(t.config.Address); err != nil {
+			if !t.config.AutoReconnect {
+				return fmt.Errorf("failed to connect: %v", err)
+			}
+			t.logger.Warn("Initial connection failed, will retry: %v", err)
+			// 触发重连
+			select {
+			case t.reconnectChan <- struct{}{}:
+			default:
+			}
+		}
+
+		// 启动心跳检测
+		if t.config.EnableHeartbeat {
+			t.wg.Add(1)
+			go t.heartbeatLoop()
+		}
+	} else {
+		// 服务端模式: 监听
+		t.logger.Info("Starting transport (passive mode)...")
+
+		if err := t.Listen(t.config.Address); err != nil {
+			return fmt.Errorf("failed to listen: %v", err)
+		}
+		t.logger.Info("Listening on %s", t.LocalAddr())
+
+		// 启动连接处理协程 (Accept 后每个连接会启动 receiveLoop)
+		t.wg.Add(1)
+		go t.handleConnections()
+	}
+
+	return nil
+}
+
+// Stop 停止传输层
+func (t *HSMSTransport) Stop() {
+	// 检查是否已选择（连接成功状态）
+	t.mu.RLock()
+	isSelected := t.state == StateSelected
+	t.mu.RUnlock()
+
+	// 优先发送 Separate.req 让对方知晓断开
+	if isSelected {
+		t.SendSeparateReq()
+	}
+
+	// 发送停止信号
+	t.mu.Lock()
+	close(t.stopChan)
+	t.mu.Unlock()
+
+	t.wg.Wait()
+	t.Close()
+	t.logger.Info("Transport stopped")
+}
+
+// ReadyChan 返回就绪通道 (Select完成时发送信号)
+func (t *HSMSTransport) ReadyChan() <-chan struct{} {
+	return t.readyChan
+}
+
+// ReconnectChan 返回重连通道 (供外部触发重连)
+func (t *HSMSTransport) ReconnectChan() chan<- struct{} {
+	return t.reconnectChan
+}
+
+// autoReconnectLoop 自动重连循环
+func (t *HSMSTransport) autoReconnectLoop() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case <-t.reconnectChan:
+			t.logger.Info("Reconnecting...")
+
+			retries := 0
+			for {
+				// 检查是否停止
+				select {
+				case <-t.stopChan:
+					return
+				default:
+				}
+
+				// 检查重试次数
+				if t.config.MaxReconnectTries > 0 && retries >= t.config.MaxReconnectTries {
+					t.logger.Error("Max reconnect tries reached")
+					return
+				}
+
+				// 等待重连延迟 (使用T5)
+				select {
+				case <-t.stopChan:
+					return
+				case <-time.After(t.config.T5):
+				}
+
+				// 尝试重连
+				if err := t.reconnect(); err == nil {
+					t.logger.Info("Reconnected successfully")
+					break
+				} else {
+					retries++
+					t.logger.Warn("Reconnect attempt %d failed: %v", retries, err)
+				}
+			}
+
+		case <-t.stopChan:
+			return
+		}
+	}
+}
+
+// reconnect 内部重连方法
+func (t *HSMSTransport) reconnect() error {
+	// 统一使用 handleDisconnect 处理断开和触发重连
+	t.handleDisconnect()
+
+	// 重新连接 (Connect 内部已包含 Select)
+	if err := t.Connect(t.config.Address); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// heartbeatLoop 心跳检测循环
+func (t *HSMSTransport) heartbeatLoop() {
+	defer t.wg.Done()
+
+	for {
+		// 每次心跳后重新计算间隔（从心跳完成开始计算）
+		heartbeatTimer := time.NewTimer(t.config.HeartbeatInterval)
+		select {
+		case <-heartbeatTimer.C:
+			// 检查是否已停止
+			select {
+			case <-t.stopChan:
+				return
+			default:
+			}
+
+			// 检查是否已选择
+			if t.IsSelected() {
+				if err := t.LinkTestReq(); err != nil {
+					t.logger.Error("Heartbeat failed: %v", err)
+					// 心跳失败时调用 handleDisconnect 触发重连
+					t.handleDisconnect()
+				} else {
+					t.logger.Debug("Heartbeat OK")
+				}
+			}
+
+		case <-t.stopChan:
+			return
+		}
+	}
+}
+
+// notifySelected 通知 Select 完成 (内部调用)
+func (t *HSMSTransport) notifySelected() {
+	select {
+	case t.readyChan <- struct{}{}:
+	default:
+	}
+}
+
+// ============================================================
 // 客户端方法
 // ============================================================
 
@@ -85,7 +269,6 @@ func (t *HSMSTransport) Connect(address string) error {
 	}
 
 	t.conn = conn
-	t.state = StateConnected
 
 	// T7: 启动 Not Selected 超时
 	t.resetT7Locked()
@@ -118,45 +301,78 @@ func (t *HSMSTransport) Listen(address string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// 关闭旧监听器
+	if t.listener != nil {
+		t.listener.Close()
+	}
+
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
 
 	t.listener = listener
+	t.conn = nil // 清空旧连接
 	t.state = StateConnected
 	return nil
 }
 
-// Accept 服务端: 接受连接 (返回新的 HSMSTransport)
-func (t *HSMSTransport) Accept() (*HSMSTransport, error) {
+// Accept 服务端: 接受连接 (单连接模式：关闭监听器，将连接设置到自身)
+func (t *HSMSTransport) Accept() error {
 	conn, err := t.listener.Accept()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	t.mu.RLock()
-	client := &HSMSTransport{
-		conn:             conn,
-		config:           t.config,
-		state:            StateConnected,
-		logger:           t.logger,
-		dataHandler:      t.dataHandler,
-		ctrlHandler:      t.ctrlHandler,
-		stateHandler:     t.stateHandler,
-		t6Timer:          time.NewTimer(t.config.T6),
-		t7Timer:          time.NewTimer(t.config.T7),
-		controlReplyChan: make(chan struct{}, 1),
-	}
-	t.mu.RUnlock()
+	// 关闭监听器
+	t.listener.Close()
+	t.listener = nil
+
+	// 设置连接
+	t.conn = conn
+	t.state = StateConnected
 
 	// T7: 启动 Not Selected 超时
-	client.resetT7()
+	t.resetT7()
 
 	// 启动读取协程
-	go client.receiveLoop()
+	go t.receiveLoop()
 
-	return client, nil
+	return nil
+}
+
+// handleConnections 服务端连接处理协程 - 单连接模式：Accept 后退出，断开后重新启动
+func (t *HSMSTransport) handleConnections() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case <-t.stopChan:
+			return
+		default:
+		}
+
+		// 打开监听器
+		if err := t.Listen(t.config.Address); err != nil {
+			t.logger.Error("Failed to listen: %v", err)
+			return
+		}
+
+		// 等待 Accept（阻塞）
+		if err := t.Accept(); err != nil {
+			select {
+			case <-t.stopChan:
+				return
+			default:
+				t.logger.Error("Failed to accept connection: %v", err)
+				continue
+			}
+		}
+
+		// Accept 成功，协程退出
+		t.logger.Info("Accepted connection from %s", t.RemoteAddr())
+		return
+	}
 }
 
 // ============================================================
@@ -310,26 +526,35 @@ func (t *HSMSTransport) LocalAddr() net.Addr {
 }
 
 // Close 关闭连接
-func (t *HSMSTransport) Close() error {
+func (t *HSMSTransport) Close() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	prevState := t.state
+	t.mu.Unlock()
+
+	// 如果之前已经是断开状态，不重复处理
+	if prevState == StateDisconnected {
+		return
+	}
 
 	// 停止所有定时器
 	t.t6Timer.Stop()
 	t.t7Timer.Stop()
 
+	// 关闭连接
+	t.mu.Lock()
+	if t.conn != nil {
+		t.conn.Close()
+		t.conn = nil
+	}
+	t.mu.Unlock()
+
+	// 通知 listener 关闭（如果有）
+	t.mu.Lock()
 	if t.listener != nil {
 		t.listener.Close()
 		t.listener = nil
 	}
-
-	if t.conn != nil {
-		err := t.conn.Close()
-		t.conn = nil
-		t.state = StateDisconnected
-		return err
-	}
-	return nil
+	t.mu.Unlock()
 }
 
 // ============================================================
@@ -514,6 +739,7 @@ func (t *HSMSTransport) handleDisconnect() {
 		t.mu.Unlock()
 		return
 	}
+	prevState := t.state
 	t.state = StateDisconnected
 	t.mu.Unlock()
 
@@ -529,6 +755,16 @@ func (t *HSMSTransport) handleDisconnect() {
 	}
 	t.mu.Unlock()
 
+	// 通知状态变更（断开连接）
+	t.notifyStateChange(prevState, StateDisconnected)
+
+	// 服务端模式：重新打开监听器
+	if !t.config.IsActive {
+		// 重新启动 handleConnections 协程
+		t.wg.Add(1)
+		go t.handleConnections()
+	}
+
 	// 检查是否已停止（避免 Stop() 时重复触发重连）
 	select {
 	case <-t.stopChan:
@@ -542,191 +778,6 @@ func (t *HSMSTransport) handleDisconnect() {
 		case t.reconnectChan <- struct{}{}:
 		default:
 		}
-	}
-}
-
-// ============================================================
-// 生命周期管理
-// ============================================================
-
-// Start 启动传输层 (根据 IsActive 自动选择客户端或服务端模式)
-func (t *HSMSTransport) Start() error {
-	if t.config.IsActive {
-		// 客户端模式: 连接并启动后台协程
-		t.logger.Info("Starting transport (active mode)...")
-
-		// 连接 (Connect 内部已启动 receiveLoop)
-		if err := t.Connect(t.config.Address); err != nil {
-			if !t.config.AutoReconnect {
-				return fmt.Errorf("failed to connect: %v", err)
-			}
-			t.logger.Warn("Initial connection failed, will retry: %v", err)
-		}
-
-		// 启动自动重连
-		if t.config.AutoReconnect {
-			t.wg.Add(1)
-			go t.autoReconnectLoop()
-		}
-
-		// 启动心跳检测
-		if t.config.EnableHeartbeat {
-			t.wg.Add(1)
-			go t.heartbeatLoop()
-		}
-	} else {
-		// 服务端模式: 监听
-		t.logger.Info("Starting transport (passive mode)...")
-
-		if err := t.Listen(t.config.Address); err != nil {
-			return fmt.Errorf("failed to listen: %v", err)
-		}
-		t.logger.Info("Listening on %s", t.LocalAddr())
-
-		// 启动连接处理协程 (Accept 后每个连接会启动 receiveLoop)
-		t.wg.Add(1)
-		go t.handleConnections()
-	}
-
-	return nil
-}
-
-// Stop 停止传输层
-func (t *HSMSTransport) Stop() {
-	// 检查是否已选择（连接成功状态）
-	t.mu.RLock()
-	isSelected := t.state == StateSelected
-	t.mu.RUnlock()
-
-	// 优先发送 Separate.req 让对方知晓断开
-	if isSelected {
-		t.SendSeparateReq()
-	}
-
-	// 发送停止信号
-	t.mu.Lock()
-	close(t.stopChan)
-	t.mu.Unlock()
-
-	t.wg.Wait()
-	t.Close()
-	t.logger.Info("Transport stopped")
-}
-
-// ReadyChan 返回就绪通道 (Select完成时发送信号)
-func (t *HSMSTransport) ReadyChan() <-chan struct{} {
-	return t.readyChan
-}
-
-// ReconnectChan 返回重连通道 (供外部触发重连)
-func (t *HSMSTransport) ReconnectChan() chan<- struct{} {
-	return t.reconnectChan
-}
-
-// autoReconnectLoop 自动重连循环
-func (t *HSMSTransport) autoReconnectLoop() {
-	defer t.wg.Done()
-
-	for {
-		select {
-		case <-t.reconnectChan:
-			t.logger.Info("Reconnecting...")
-
-			retries := 0
-			for {
-				// 检查是否停止
-				select {
-				case <-t.stopChan:
-					return
-				default:
-				}
-
-				// 检查重试次数
-				if t.config.MaxReconnectTries > 0 && retries >= t.config.MaxReconnectTries {
-					t.logger.Error("Max reconnect tries reached")
-					return
-				}
-
-				// 等待重连延迟 (使用T5)
-				time.Sleep(t.config.T5)
-
-				// 尝试重连
-				if err := t.reconnect(); err == nil {
-					t.logger.Info("Reconnected successfully")
-					break
-				} else {
-					retries++
-					t.logger.Warn("Reconnect attempt %d failed: %v", retries, err)
-				}
-			}
-
-		case <-t.stopChan:
-			return
-		}
-	}
-}
-
-// reconnect 内部重连方法
-func (t *HSMSTransport) reconnect() error {
-	t.mu.Lock()
-	t.state = StateDisconnected
-	t.mu.Unlock()
-
-	// 关闭旧连接
-	t.Close()
-
-	// 重新连接 (Connect 内部已包含 Select)
-	if err := t.Connect(t.config.Address); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// heartbeatLoop 心跳检测循环
-func (t *HSMSTransport) heartbeatLoop() {
-	defer t.wg.Done()
-
-	ticker := time.NewTicker(t.config.HeartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// 检查是否已停止
-			select {
-			case <-t.stopChan:
-				return
-			default:
-			}
-
-			// 检查是否已选择
-			if t.IsSelected() {
-				if err := t.LinkTestReq(); err != nil {
-					t.logger.Error("Heartbeat failed: %v", err)
-					// 触发重连
-					if t.config.AutoReconnect {
-						select {
-						case t.reconnectChan <- struct{}{}:
-						default:
-						}
-					}
-				} else {
-					t.logger.Debug("Heartbeat OK")
-				}
-			}
-
-		case <-t.stopChan:
-			return
-		}
-	}
-}
-
-// notifySelected 通知 Select 完成 (内部调用)
-func (t *HSMSTransport) notifySelected() {
-	select {
-	case t.readyChan <- struct{}{}:
-	default:
 	}
 }
 
@@ -764,31 +815,4 @@ func (t *HSMSTransport) OnMessage(handler func(*Message)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.dataHandler = handler
-}
-
-// handleConnections 服务端连接处理协程 - 接受连接后由 receiveLoop 处理消息
-func (t *HSMSTransport) handleConnections() {
-	defer t.wg.Done()
-
-	for {
-		select {
-		case <-t.stopChan:
-			return
-		default:
-		}
-
-		client, err := t.Accept()
-		if err != nil {
-			select {
-			case <-t.stopChan:
-				return
-			default:
-				t.logger.Error("Failed to accept connection: %v", err)
-				continue
-			}
-		}
-
-		t.logger.Info("Accepted connection from %s", client.RemoteAddr())
-
-	}
 }
