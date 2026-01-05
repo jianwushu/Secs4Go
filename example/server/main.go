@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	secs4go "github.com/jianwushu/secs4go/core"
+	"github.com/jianwushu/Secs4go/secs4go"
 )
 
 // SecsServer SECS-I/GEM服务端示例

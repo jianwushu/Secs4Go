@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	secs4go "github.com/jianwushu/secs4go/core"
+	"github.com/jianwushu/Secs4go/secs4go"
 )
 
 // 变量声明

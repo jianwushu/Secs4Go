@@ -1,8 +1,6 @@
 package main
 
-import (
-	secs4go "github.com/jianwushu/secs4go/core"
-)
+import "github.com/jianwushu/Secs4go/secs4go"
 
 const (
 	DACK0  = 0
