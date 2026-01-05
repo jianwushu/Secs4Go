@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	secs4go_v4 "github.com/jianwushu/secs4go/v4"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 // SecsServer SECS-I/GEM服务端示例
@@ -19,19 +19,21 @@ const (
 	DeviceID      = 0 // 设备ID
 )
 
-var server *secs4go_v4.SecsGem
+var server *secs4go.SecsGem
 
 func main() {
 	// 1. 创建配置（服务端模式）
-	config := secs4go_v4.DefaultConfig(ListenAddress)
+	config := secs4go.DefaultConfig(ListenAddress)
 	config.DeviceID = DeviceID
-	config.IsActive = false // 服务端模式
-	config.EnableHeartbeat = true
+	config.IsActive = false
+	config.EnableHeartbeat = false
 
-	hsmsConnection := secs4go_v4.NewHSMSTransport(config)
+	hsmsConnection := secs4go.NewHSMSTransport(config)
+
+	hsmsConnection.OnStateChange(handleStateChange)
 
 	// 2. 创建会话
-	server = secs4go_v4.NewSecsGem("Host", config, hsmsConnection, nil)
+	server = secs4go.NewSecsGem("Host", config, hsmsConnection, nil)
 
 	// 3. 设置消息处理回调
 	server.OnMessage(handleMessage)
@@ -42,7 +44,7 @@ func main() {
 	}
 	log.Printf("服务端已启动，监听: %s", ListenAddress)
 
-	// testSendMessage()
+	testSendMessage()
 
 	// 6. 等待退出信号
 	sigChan := make(chan os.Signal, 1)
@@ -55,16 +57,12 @@ func main() {
 }
 
 // handleMessage 处理数据消息
-func handleMessage(msg *secs4go_v4.Message) {
+func handleMessage(msg *secs4go.Message) {
 	sf := fmt.Sprintf("S%vF%v", msg.Stream, msg.Function)
 	switch sf {
 	case "S1F1":
 		log.Printf("收到 S1F1, 发送 S1F2 回复")
-		reply := secs4go_v4.NewMessage(1, 2).
-			WithItem(secs4go_v4.L(
-				secs4go_v4.A("HOST"),
-				secs4go_v4.A("1.0"),
-			))
+		reply := HandleS1F1(msg.Item)
 		if err := server.SendReply(msg, reply); err != nil {
 			log.Printf("发送S1F2失败: %v", err)
 		}
@@ -79,6 +77,12 @@ func handleMessage(msg *secs4go_v4.Message) {
 		reply := HandleS1F11(msg.Item)
 		if err := server.SendReply(msg, reply); err != nil {
 			log.Printf("发送S1F12失败: %v", err)
+		}
+	case "S1F13":
+		log.Printf("收到 S1F13, 发送 S1F14 回复")
+		reply := HandleS1F13(msg.Item)
+		if err := server.SendReply(msg, reply); err != nil {
+			log.Printf("发送S1F14失败: %v", err)
 		}
 	case "S2F33":
 		log.Printf("收到 S2F33, 发送 S2F34 回复")
@@ -103,29 +107,32 @@ func handleMessage(msg *secs4go_v4.Message) {
 	}
 }
 
+func handleStateChange(oldState, newState secs4go.ConnectionState) {
+	log.Printf("状态变更: %s -> %s", oldState, newState)
+}
+
 func testSendMessage() {
+
+	i := 10
 	for {
 		if server.IsSelected() {
+
+			i = i + 1
+			UpdateDv("1001", fmt.Sprintf("CRR_TEST_%d", i))
+
+			time.Sleep(1 * time.Second)
+
 			go func() {
-				msg := secs4go_v4.NewMessage(6, 11).WithWBit(true).WithItem(
-					secs4go_v4.L(
-						secs4go_v4.U2(0),
-						secs4go_v4.U4(10020),
-						secs4go_v4.L(
-							secs4go_v4.L(
-								secs4go_v4.U4(10020),
-								secs4go_v4.L(
-									secs4go_v4.A("CRR_TEST"),
-									secs4go_v4.A("2025-12-31 10:00:00"),
-								),
-							),
-						),
-					),
-				)
-				_, err := server.Send(msg)
+				msg, err := Trigger10020()
+				if err != nil {
+					log.Printf("触发10020失败: %v", err)
+					return
+				}
+				_, err = server.Send(msg)
 				if err != nil {
 					log.Printf("S6F11 失败: %v", err)
 				}
+
 			}()
 
 			time.Sleep(1 * time.Second)

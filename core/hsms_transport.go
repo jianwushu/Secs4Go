@@ -1,4 +1,4 @@
-package secs4go_v4
+package secs4go
 
 import (
 	"errors"
@@ -115,6 +115,12 @@ func (t *HSMSTransport) Start() error {
 		// 启动连接处理协程 (Accept 后每个连接会启动 receiveLoop)
 		t.wg.Add(1)
 		go t.handleConnections()
+
+		// 启动心跳检测（服务端模式也启用）
+		if t.config.EnableHeartbeat {
+			t.wg.Add(1)
+			go t.heartbeatLoop()
+		}
 	}
 
 	return nil

@@ -1,4 +1,4 @@
-package secs4go_v4
+package secs4go
 
 import (
 	"fmt"
@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,9 +83,12 @@ func (l *defaultLogger) Error(format string, args ...interface{}) {
 // ============================================================
 
 type fileLogger struct {
-	logger *log.Logger
-	level  LogLevel
-	file   *os.File
+	logger     *log.Logger
+	level      LogLevel
+	file       *os.File
+	currentHour int
+	mu         sync.Mutex
+	logDir     string
 }
 
 // NewFileLogger 创建设备名称指定的文件logger
@@ -123,9 +127,11 @@ func NewFileLoggerWithLevel(deviceName string, level LogLevel) Logger {
 	logger := log.New(multiWriter, "", log.LstdFlags|log.Lmicroseconds)
 
 	return &fileLogger{
-		logger: logger,
-		level:  level,
-		file:   file,
+		logger:       logger,
+		level:        level,
+		file:         file,
+		currentHour:  currentTime.Hour(),
+		logDir:       logDir,
 	}
 }
 
@@ -145,26 +151,64 @@ func sanitizeDeviceName(deviceName string) string {
 
 func (l *fileLogger) Debug(format string, args ...interface{}) {
 	if l.level <= LogLevelDebug {
+		l.checkAndSwitchFile()
 		l.logger.Printf("[DEBUG] "+format, args...)
 	}
 }
 
 func (l *fileLogger) Info(format string, args ...interface{}) {
 	if l.level <= LogLevelInfo {
+		l.checkAndSwitchFile()
 		l.logger.Printf("[INFO] "+format, args...)
 	}
 }
 
 func (l *fileLogger) Warn(format string, args ...interface{}) {
 	if l.level <= LogLevelWarn {
+		l.checkAndSwitchFile()
 		l.logger.Printf("[WARN] "+format, args...)
 	}
 }
 
 func (l *fileLogger) Error(format string, args ...interface{}) {
 	if l.level <= LogLevelError {
+		l.checkAndSwitchFile()
 		l.logger.Printf("[ERROR] "+format, args...)
 	}
+}
+
+// checkAndSwitchFile 检查是否需要切换日志文件（按小时）
+func (l *fileLogger) checkAndSwitchFile() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	currentHour := time.Now().Hour()
+	if currentHour == l.currentHour {
+		return
+	}
+
+	// 切换日志文件
+	if l.file != nil {
+		l.file.Close()
+	}
+
+	currentTime := time.Now()
+	logFileName := fmt.Sprintf("%s.log", currentTime.Format("20060102_15"))
+	logFilePath := filepath.Join(l.logDir, logFileName)
+
+	file, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		// 如果打开文件失败，回退到仅输出到 stdout
+		l.logger = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+		l.file = nil
+		l.currentHour = currentHour
+		return
+	}
+
+	multiWriter := io.MultiWriter(os.Stdout, file)
+	l.logger = log.New(multiWriter, "", log.LstdFlags|log.Lmicroseconds)
+	l.file = file
+	l.currentHour = currentHour
 }
 
 // Close 关闭文件logger

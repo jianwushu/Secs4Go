@@ -1,4 +1,4 @@
-package secs4go_v4
+package secs4go
 
 import (
 	"fmt"

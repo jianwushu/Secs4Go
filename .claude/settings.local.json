@@ -15,7 +15,8 @@
       "Bash(go run:*)",
       "Bash(nul:*)",
       "Bash(go mod init:*)",
-      "Bash(go mod edit:*)"
+      "Bash(go mod edit:*)",
+      "mcp__context7__query-docs"
     ],
     "deny": [],
     "ask": []

@@ -1,7 +1,7 @@
 package main
 
 import (
-	secs4go_v4 "github.com/jianwushu/secs4go/v4"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 const (
@@ -19,14 +19,16 @@ const (
 	ERACK0 = 0
 	ERACK1 = 1
 	ERACK2 = 2
-	ERACK3 = 3
-	ERACK4 = 4
 )
 
-func DACKMessage(ack byte) *secs4go_v4.Message {
-	return secs4go_v4.NewMessage(2, 34).WithItem(secs4go_v4.B(ack))
+func DACKMessage(ack byte) *secs4go.Message {
+	return secs4go.NewMessage(2, 34).WithItem(secs4go.B(ack))
 }
 
-func LRACKMessage(ack byte) *secs4go_v4.Message {
-	return secs4go_v4.NewMessage(2, 36).WithItem(secs4go_v4.B(ack))
+func LRACKMessage(ack byte) *secs4go.Message {
+	return secs4go.NewMessage(2, 36).WithItem(secs4go.B(ack))
+}
+
+func ERACKMessage(ack byte) *secs4go.Message {
+	return secs4go.NewMessage(2, 38).WithItem(secs4go.B(ack))
 }

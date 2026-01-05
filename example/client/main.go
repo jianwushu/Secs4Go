@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	secs4go_v4 "github.com/jianwushu/secs4go/v4"
+	secs4go_v4 "github.com/jianwushu/secs4go/core"
 )
 
 // SecsClient SECS-I/GEM客户端示例
