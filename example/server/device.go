@@ -484,7 +484,7 @@ func buildEvent(ceid string) (*secs4go.Message, error) {
 		reportList = append(reportList, report)
 	}
 
-	s6f11 := secs4go.NewMessage(6, 11).WithItem(secs4go.L(
+	s6f11 := secs4go.NewMessage(6, 11).WithWBit(true).WithItem(secs4go.L(
 		secs4go.U2(0),
 		secs4go.U4(String2UInt32(ceid)),
 		secs4go.L(reportList...),

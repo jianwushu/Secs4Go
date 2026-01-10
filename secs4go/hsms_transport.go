@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -75,6 +76,18 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 
 // Start 启动传输层 (根据 IsActive 自动选择客户端或服务端模式)
 func (t *HSMSTransport) Start() error {
+	// 服务端模式：检查是否需要重置状态（支持二次启动）
+	if !t.config.IsActive {
+		t.mu.Lock()
+		if t.state == StateDisconnected {
+			// 重置 stopChan（创建新的通道实例以支持二次启动）
+			t.stopChan = make(chan struct{})
+			// 预置状态为 Connected，表示即将开始监听
+			t.state = StateConnected
+		}
+		t.mu.Unlock()
+	}
+
 	if t.config.IsActive {
 		// 客户端模式: 连接并启动后台协程
 		t.logger.Info("Starting transport (active mode)...")
@@ -131,6 +144,7 @@ func (t *HSMSTransport) Stop() {
 	// 检查是否已选择（连接成功状态）
 	t.mu.RLock()
 	isSelected := t.state == StateSelected
+	currentState := t.state
 	t.mu.RUnlock()
 
 	// 优先发送 Separate.req 让对方知晓断开
@@ -138,12 +152,20 @@ func (t *HSMSTransport) Stop() {
 		t.SendSeparateReq()
 	}
 
-	// 发送停止信号
+	// 发送停止信号（先关闭 stopChan，让协程退出）
 	t.mu.Lock()
 	close(t.stopChan)
 	t.mu.Unlock()
 
+	// 等待所有协程退出
 	t.wg.Wait()
+
+	// 在关闭连接前触发状态变更事件
+	if currentState == StateSelected || currentState == StateConnected {
+		t.notifyStateChange(currentState, StateDisconnected)
+	}
+
+	// 关闭连接
 	t.Close()
 	t.logger.Info("Transport stopped")
 }
@@ -535,12 +557,14 @@ func (t *HSMSTransport) LocalAddr() net.Addr {
 func (t *HSMSTransport) Close() {
 	t.mu.Lock()
 	prevState := t.state
-	t.mu.Unlock()
-
-	// 如果之前已经是断开状态，不重复处理
+	// 先检查是否已断开，避免重复处理
 	if prevState == StateDisconnected {
+		t.mu.Unlock()
 		return
 	}
+	// 再设置状态为断开
+	t.state = StateDisconnected
+	t.mu.Unlock()
 
 	// 停止所有定时器
 	t.t6Timer.Stop()
@@ -578,11 +602,23 @@ func (t *HSMSTransport) receiveLoop() {
 			return
 		}
 
+		// 检查是否已停止（避免读到已关闭的连接）
+		select {
+		case <-t.stopChan:
+			return
+		default:
+		}
+
 		// T8: 设置读取超时
 		// conn.SetReadDeadline(time.Now().Add(t.config.T8))
 
 		header, itemData, err := ReadHSMSFrame(conn)
 		if err != nil {
+			// 检查是否是 "use of closed network connection" 错误
+			// 这种错误发生在 Stop() 关闭连接后，receiveLoop 仍在读取的情况
+			if strings.Contains(err.Error(), "use of closed") {
+				return // 静默返回，避免不必要的错误日志
+			}
 			t.logger.Error(fmt.Sprintf("read error: %s", err))
 			t.handleDisconnect()
 			return

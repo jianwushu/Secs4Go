@@ -24,6 +24,7 @@ var server *secs4go.SecsGem
 func main() {
 	// 1. 创建配置（服务端模式）
 	config := secs4go.DefaultConfig(ListenAddress)
+	config.T3 = 10 * time.Second
 	config.DeviceID = DeviceID
 	config.IsActive = false
 	config.EnableHeartbeat = false
@@ -44,7 +45,21 @@ func main() {
 	}
 	log.Printf("服务端已启动，监听: %s", ListenAddress)
 
-	testSendMessage()
+	time.Sleep(5 * time.Second)
+
+	if hsmsConnection.IsSelected() {
+		hsmsConnection.Stop()
+	}
+
+	time.Sleep(5 * time.Second)
+
+	// 4. 启动会话（开始监听）
+	if err := hsmsConnection.Start(); err != nil {
+		log.Fatalf("启动失败2: %v", err)
+	}
+	log.Printf("服务端已启动2，监听: %s", ListenAddress)
+
+	go testSendMessage()
 
 	// 6. 等待退出信号
 	sigChan := make(chan os.Signal, 1)
@@ -114,6 +129,7 @@ func handleStateChange(oldState, newState secs4go.ConnectionState) {
 func testSendMessage() {
 
 	i := 10
+
 	for {
 		if server.IsSelected() {
 
@@ -135,8 +151,8 @@ func testSendMessage() {
 
 			}()
 
-			time.Sleep(1 * time.Second)
+			time.Sleep(45 * time.Second)
 		}
-
 	}
+
 }
