@@ -33,8 +33,10 @@ func main() {
 
 	hsmsConnection.OnStateChange(handleStateChange)
 
+	codec, _ := secs4go.NewItemCodec(config.ItemAEncoding)
+
 	// 2. 创建会话
-	server = secs4go.NewSecsGem("Host", config, hsmsConnection, nil)
+	server = secs4go.NewSecsGem("Host", config, hsmsConnection, nil, codec)
 
 	// 3. 设置消息处理回调
 	server.OnMessage(handleMessage)
@@ -44,20 +46,6 @@ func main() {
 		log.Fatalf("启动失败: %v", err)
 	}
 	log.Printf("服务端已启动，监听: %s", ListenAddress)
-
-	time.Sleep(5 * time.Second)
-
-	if hsmsConnection.IsSelected() {
-		hsmsConnection.Stop()
-	}
-
-	time.Sleep(5 * time.Second)
-
-	// 4. 启动会话（开始监听）
-	if err := hsmsConnection.Start(); err != nil {
-		log.Fatalf("启动失败2: %v", err)
-	}
-	log.Printf("服务端已启动2，监听: %s", ListenAddress)
 
 	go testSendMessage()
 
@@ -134,7 +122,7 @@ func testSendMessage() {
 		if server.IsSelected() {
 
 			i = i + 1
-			UpdateDv("1001", fmt.Sprintf("CRR_TEST_%d", i))
+			UpdateDv("1001", fmt.Sprintf("CRR_好_%d", i))
 
 			time.Sleep(1 * time.Second)
 

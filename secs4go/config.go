@@ -31,6 +31,8 @@ type Config struct {
 	EnableHeartbeat   bool          // 默认: true
 	HeartbeatInterval time.Duration // 默认: 60s
 
+	// 编码配置
+	ItemAEncoding string // 默认: "ASCII" (支持 "ASCII", "GBK", "UTF-8", "GB2312")
 }
 
 // DefaultConfig 返回默认配置
@@ -48,6 +50,7 @@ func DefaultConfig(address string) *Config {
 		MaxReconnectTries: -1, // 无限重试
 		EnableHeartbeat:   true,
 		HeartbeatInterval: 60 * time.Second,
+		ItemAEncoding:     "ASCII",
 	}
 }
 

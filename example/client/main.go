@@ -29,8 +29,10 @@ func main() {
 
 	hsmsConnection := secs4go.NewHSMSTransport(config)
 
+	codec, _ := secs4go.NewItemCodec("ASCII")
+
 	// 2. 创建会话
-	client = secs4go.NewSecsGem("TEST", config, hsmsConnection, nil)
+	client = secs4go.NewSecsGem("TEST", config, hsmsConnection, nil, codec)
 
 	// 3. 设置消息处理回调（接收服务端主动发送的消息）
 	client.OnMessage(handleMessage)
@@ -58,7 +60,7 @@ func handleMessage(msg *secs4go.Message) {
 		log.Printf("收到 S1F1, 发送 S1F2 回复")
 		reply := secs4go.NewMessage(1, 2).
 			WithItem(secs4go.L(
-				secs4go.A("HOST"),
+				secs4go.A("你好"),
 				secs4go.A("1.0"),
 			))
 		if err := client.SendReply(msg, reply); err != nil {

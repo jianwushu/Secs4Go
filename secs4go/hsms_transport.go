@@ -48,9 +48,9 @@ type HSMSTransport struct {
 	readyChan     chan struct{} // 就绪信号通道 (Select完成)
 
 	// 回调
-	ctrlHandler  func(HSMSHeader)   // 控制消息处理回调 (服务端)
-	stateHandler StateChangeHandler // 状态变更回调
-	dataHandler  func(*Message)     // 数据消息处理回调 (所有数据会话)
+	ctrlHandler  func(HSMSHeader)         // 控制消息处理回调 (服务端)
+	stateHandler StateChangeHandler       // 状态变更回调
+	dataHandler  func(HSMSHeader, []byte) // 数据消息处理回调 (所有数据会话)
 
 	// SystemBytes 生成器
 	systemByte uint32
@@ -640,18 +640,18 @@ func (t *HSMSTransport) receiveLoop() {
 // processDataMessage 处理数据消息 - 只做解析，路由到 secsgem 的回调
 func (t *HSMSTransport) processDataMessage(header HSMSHeader, itemData []byte) {
 	// 解析消息 (传入 self transport 用于回复)
-	msg, err := ParseMessage(header, itemData, t)
-	if err != nil {
-		t.logger.Error("Failed to parse message: %v", err)
-		return
-	}
+	// msg, err := ParseMessage(header, itemData, t, t.itemCodec)
+	// if err != nil {
+	// 	t.logger.Error("Failed to parse message: %v", err)
+	// 	return
+	// }
 
 	// 路由到数据消息回调（所有数据会话由 secsgem 统一处理）
 	t.mu.RLock()
 	handler := t.dataHandler
 	t.mu.RUnlock()
 	if handler != nil {
-		handler(msg)
+		handler(header, itemData)
 	}
 }
 
@@ -853,7 +853,7 @@ func (t *HSMSTransport) notifyStateChange(oldState, newState ConnectionState) {
 }
 
 // OnMessage 设置消息处理回调（收到数据消息时调用）
-func (t *HSMSTransport) OnMessage(handler func(*Message)) {
+func (t *HSMSTransport) OnMessage(handler func(HSMSHeader, []byte)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.dataHandler = handler

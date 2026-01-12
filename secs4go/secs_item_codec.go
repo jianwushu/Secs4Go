@@ -4,6 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"strings"
+
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // ============================================================
@@ -18,24 +23,58 @@ var (
 )
 
 // ============================================================
-// Item 编码 (纯函数，无状态)
+// ItemCodec 编解码器
 // ============================================================
 
+// ItemCodec 负责 Item 的编解码，支持配置字符串编码
+type ItemCodec struct {
+	encoder *encoding.Encoder
+	decoder *encoding.Decoder
+}
+
+// NewItemCodec 创建新的编解码器
+func NewItemCodec(encodingName string) (*ItemCodec, error) {
+	var enc encoding.Encoding
+
+	switch strings.ToUpper(encodingName) {
+	case "GBK":
+		enc = simplifiedchinese.GBK
+	case "GB2312":
+		enc = simplifiedchinese.GB18030 // GB18030 兼容 GB2312
+	case "UTF-8", "UTF8":
+		enc = nil // UTF-8 是默认值，不需要转换
+	case "ASCII":
+		enc = nil // ASCII 也是默认处理（直接转换）
+	default:
+		// 默认为 ASCII/UTF-8 (不转换)
+		enc = nil
+	}
+
+	codec := &ItemCodec{}
+	if enc != nil {
+		codec.encoder = enc.NewEncoder()
+		codec.decoder = enc.NewDecoder()
+	}
+
+	return codec, nil
+}
+
+// DefaultItemCodec 默认编解码器 (UTF-8/ASCII)
+var DefaultItemCodec, _ = NewItemCodec("ASCII")
+
 // EncodeItem 编码Item
-// 格式: [1字节格式码][1-3字节长度][数据...]
-// 注意: List的长度字段表示子item数量，其他类型表示数据字节数
-func EncodeItem(item *Item) ([]byte, error) {
+func (c *ItemCodec) EncodeItem(item *Item) ([]byte, error) {
 	if item == nil {
 		return nil, nil
 	}
 
-	// 特殊处理 List：长度是子item数量，不是字节数
+	// 特殊处理 List
 	if item.Type == TypeList {
-		return encodeListItem(item.Value)
+		return c.encodeListItem(item.Value)
 	}
 
-	// 其他类型：长度是数据字节数
-	data, err := itemValueToBytes(item.Type, item.Value)
+	// 其他类型
+	data, err := c.itemValueToBytes(item.Type, item.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +91,7 @@ func EncodeItem(item *Item) ([]byte, error) {
 		lenBytes = 3
 	}
 
-	// 格式字节: 高6位类型(左移2位), 低2位长度字节数
+	// 格式字节
 	formatByte := byte(item.Type) << 2
 	switch lenBytes {
 	case 1:
@@ -84,14 +123,13 @@ func EncodeItem(item *Item) ([]byte, error) {
 	return result, nil
 }
 
-// encodeListItem 编码List Item (长度是子item数量)
-func encodeListItem(value interface{}) ([]byte, error) {
+// encodeListItem 编码List Item
+func (c *ItemCodec) encodeListItem(value interface{}) ([]byte, error) {
 	items, ok := value.([]*Item)
 	if !ok {
 		return nil, ErrInvalidList
 	}
 
-	// List 的长度是子item数量
 	count := len(items)
 	var lenBytes int
 	if count <= 0xFF {
@@ -102,7 +140,6 @@ func encodeListItem(value interface{}) ([]byte, error) {
 		lenBytes = 3
 	}
 
-	// 格式字节: List(0x00 << 2) + 长度字节数
 	formatByte := byte(TypeList) << 2
 	if lenBytes == 1 {
 		formatByte |= 0x01
@@ -112,21 +149,18 @@ func encodeListItem(value interface{}) ([]byte, error) {
 		formatByte |= 0x03
 	}
 
-	// 编码所有子item
 	var itemData []byte
 	for _, item := range items {
-		data, err := EncodeItem(item)
+		data, err := c.EncodeItem(item)
 		if err != nil {
 			return nil, err
 		}
 		itemData = append(itemData, data...)
 	}
 
-	// 构建结果
 	result := make([]byte, 1+lenBytes+len(itemData))
 	result[0] = formatByte
 
-	// 写入长度 (子item数量)
 	if lenBytes == 1 {
 		result[1] = byte(count)
 	} else if lenBytes == 2 {
@@ -137,19 +171,18 @@ func encodeListItem(value interface{}) ([]byte, error) {
 		result[3] = byte(count)
 	}
 
-	// 复制子item数据
 	copy(result[1+lenBytes:], itemData)
 
 	return result, nil
 }
 
 // itemValueToBytes 将Item值转换为字节数组
-func itemValueToBytes(itemType ItemType, value interface{}) ([]byte, error) {
+func (c *ItemCodec) itemValueToBytes(itemType ItemType, value interface{}) ([]byte, error) {
 	switch itemType {
-	// case TypeList:
-	// 	return encodeList(value)
-	case TypeBinary, TypeASCII, TypeJIS8:
+	case TypeBinary, TypeJIS8:
 		return encodeBinary(value)
+	case TypeASCII:
+		return c.encodeString(value) // 使用配置的编码
 	case TypeBoolean:
 		return encodeBoolean(value)
 	case TypeInt8:
@@ -177,14 +210,8 @@ func itemValueToBytes(itemType ItemType, value interface{}) ([]byte, error) {
 	}
 }
 
-// ============================================================
-// Item 解码 (纯函数，无状态)
-// ============================================================
-
 // DecodeItem 解码Item
-// 返回: Item, 消耗的字节数, 错误
-// 注意: List的长度字段表示子item数量，需要递归解码确定实际字节数
-func DecodeItem(data []byte) (*Item, int, error) {
+func (c *ItemCodec) DecodeItem(data []byte) (*Item, int, error) {
 	if len(data) < 2 {
 		return nil, 0, ErrInvalidItem
 	}
@@ -193,7 +220,6 @@ func DecodeItem(data []byte) (*Item, int, error) {
 	itemType := ItemType(formatByte >> 2)
 	lengthBytes := int(formatByte & 0x03)
 
-	// 解析长度
 	var length int
 	headerLen := 1 + lengthBytes
 
@@ -205,21 +231,17 @@ func DecodeItem(data []byte) (*Item, int, error) {
 		length = int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 	}
 
-	// 特殊处理 List：长度是子item数量
 	if itemType == TypeList {
-		return decodeListItem(data, headerLen, length)
+		return c.decodeListItem(data, headerLen, length)
 	}
 
-	// 其他类型：长度是数据字节数
 	if len(data) < headerLen+length {
 		return nil, 0, ErrInvalidItem
 	}
 
-	// 提取数据
 	itemData := data[headerLen : headerLen+length]
 
-	// 解码值
-	value, err := itemBytesToValue(itemType, itemData)
+	value, err := c.itemBytesToValue(itemType, itemData)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -228,7 +250,7 @@ func DecodeItem(data []byte) (*Item, int, error) {
 }
 
 // decodeListItem 解码List Item
-func decodeListItem(data []byte, headerLen, itemCount int) (*Item, int, error) {
+func (c *ItemCodec) decodeListItem(data []byte, headerLen, itemCount int) (*Item, int, error) {
 	items := make([]*Item, 0)
 	offset := headerLen
 
@@ -236,7 +258,7 @@ func decodeListItem(data []byte, headerLen, itemCount int) (*Item, int, error) {
 		if offset >= len(data) {
 			return nil, 0, ErrInvalidItem
 		}
-		item, consumed, err := DecodeItem(data[offset:])
+		item, consumed, err := c.DecodeItem(data[offset:])
 		if err != nil {
 			return nil, 0, err
 		}
@@ -248,13 +270,14 @@ func decodeListItem(data []byte, headerLen, itemCount int) (*Item, int, error) {
 }
 
 // itemBytesToValue 将字节数组转换为Item值
-func itemBytesToValue(itemType ItemType, data []byte) (interface{}, error) {
+func (c *ItemCodec) itemBytesToValue(itemType ItemType, data []byte) (interface{}, error) {
 	switch itemType {
 	case TypeList:
-		// List 由 DecodeItem 特殊处理，不会走到这里
 		return nil, nil
-	case TypeBinary, TypeASCII, TypeJIS8:
+	case TypeBinary, TypeJIS8:
 		return data, nil
+	case TypeASCII:
+		return c.decodeString(data) // 使用配置的编码
 	case TypeBoolean:
 		return decodeBoolean(data)
 	case TypeInt8:
@@ -283,7 +306,56 @@ func itemBytesToValue(itemType ItemType, data []byte) (interface{}, error) {
 }
 
 // ============================================================
-// Binary/ASCII/JIS8 编码/解码
+// 字符串编码/解码 (支持配置)
+// ============================================================
+
+func (c *ItemCodec) encodeString(value interface{}) ([]byte, error) {
+	str, ok := value.(string)
+	if !ok {
+		// 尝试转换 []byte
+		if b, ok := value.([]byte); ok {
+			str = string(b)
+		} else {
+			return nil, ErrInvalidValue
+		}
+	}
+
+	if c.encoder == nil {
+		return []byte(str), nil
+	}
+
+	data, _, err := transform.Bytes(c.encoder, []byte(str))
+	return data, err
+}
+
+func (c *ItemCodec) decodeString(data []byte) (interface{}, error) {
+	if c.decoder == nil {
+		return data, nil // 保持原始字节，由上层转换为string
+	}
+
+	decoded, _, err := transform.Bytes(c.decoder, data)
+	if err != nil {
+		return data, nil // 解码失败返回原始数据
+	}
+	return decoded, nil
+}
+
+// ============================================================
+// 兼容性接口 (使用默认编解码器)
+// ============================================================
+
+// EncodeItem 编码Item (使用默认UTF-8/ASCII)
+func EncodeItem(item *Item) ([]byte, error) {
+	return DefaultItemCodec.EncodeItem(item)
+}
+
+// DecodeItem 解码Item (使用默认UTF-8/ASCII)
+func DecodeItem(data []byte) (*Item, int, error) {
+	return DefaultItemCodec.DecodeItem(data)
+}
+
+// ============================================================
+// Binary/ASCII/JIS8 编码/解码 (基础实现)
 // ============================================================
 
 func encodeBinary(value interface{}) ([]byte, error) {
@@ -375,9 +447,9 @@ func decodeInt16(data []byte) ([]int16, error) {
 	return vals, nil
 }
 
-// ============================================================编码/解码
-
-// Int32 // ============================================================
+// ============================================================
+// Int32 编码/解码
+// ============================================================
 
 func encodeInt32(value interface{}) ([]byte, error) {
 	vals, ok := value.([]int32)

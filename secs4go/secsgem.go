@@ -29,14 +29,19 @@ type SecsGem struct {
 	// 回调
 	msgHandler func(*Message) // 数据消息处理回调
 
+	itemCodec *ItemCodec // 编解码器
+
 	// 独立收发机制：使用 SystemBytes 关联请求和回复
 	pendingReplies sync.Map // map[uint32]chan []byte
 }
 
 // NewSecsGem 创建会话
-func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport, logger Logger) *SecsGem {
+func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport, logger Logger, codec *ItemCodec) *SecsGem {
 	if logger == nil {
 		logger = NewFileLogger(deviceName)
+	}
+	if codec == nil {
+		codec = DefaultItemCodec
 	}
 	hsmsConnection.logger = logger
 	secsGem := &SecsGem{
@@ -44,6 +49,7 @@ func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport
 		config:     config,
 		transport:  hsmsConnection,
 		logger:     logger,
+		itemCodec:  codec,
 	}
 	// 设置数据消息回调（所有数据会话由 secsgem 统一处理）
 	hsmsConnection.OnMessage(secsGem.handleDataMessage)
@@ -68,7 +74,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	var itemData []byte
 	if msg.Item != nil {
 		var err error
-		itemData, err = EncodeItem(msg.Item)
+		itemData, err = s.itemCodec.EncodeItem(msg.Item)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode item: %v", err)
 		}
@@ -102,7 +108,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 		return nil, nil
 	}
 
-	parsed, err := ParseMessage(header, replyData, s.transport)
+	parsed, err := ParseMessage(header, replyData, s.transport, s.itemCodec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse reply: %v", err)
 	}
@@ -115,7 +121,7 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	var itemData []byte
 	if reply.Item != nil {
 		var err error
-		itemData, err = EncodeItem(reply.Item)
+		itemData, err = s.itemCodec.EncodeItem(reply.Item)
 		if err != nil {
 			return fmt.Errorf("failed to encode item: %v", err)
 		}
@@ -173,7 +179,13 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 }
 
 // handleDataMessage 处理收到的数据消息（所有数据会话统一处理）
-func (s *SecsGem) handleDataMessage(msg *Message) {
+func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
+
+	msg, err := ParseMessage(header, itemData, s.transport, s.itemCodec)
+	if err != nil {
+		s.logger.Error("Failed to parse message: %v", err)
+		return
+	}
 	// 记录接收日志
 	s.logReceivedData(msg)
 
@@ -210,7 +222,7 @@ func (s *SecsGem) logReceivedData(msg *Message) {
 	var itemData []byte
 	if msg.Item != nil {
 		var err error
-		itemData, err = EncodeItem(msg.Item)
+		itemData, err = s.itemCodec.EncodeItem(msg.Item)
 		if err != nil {
 			s.logger.Error("Failed to encode item for log: %v", err)
 			return

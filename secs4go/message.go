@@ -84,7 +84,7 @@ func BuildHSMSHeader(deviceID uint16, msg *Message, sType SType, systemBytes uin
 
 // ParseMessage HSMSHeader + []byte → Message
 // 从HSMSHeader提取S/F/WBit，解析Item
-func ParseMessage(header HSMSHeader, data []byte, sender *HSMSTransport) (*Message, error) {
+func ParseMessage(header HSMSHeader, data []byte, sender *HSMSTransport, codec *ItemCodec) (*Message, error) {
 	msg := &Message{
 		Stream:      header.Stream(),
 		WBit:        header.WBit(),
@@ -96,7 +96,15 @@ func ParseMessage(header HSMSHeader, data []byte, sender *HSMSTransport) (*Messa
 
 	// 解析Item数据
 	if len(data) > 0 {
-		item, _, err := DecodeItem(data)
+		var item *Item
+		var err error
+
+		if codec != nil {
+			item, _, err = codec.DecodeItem(data)
+		} else {
+			item, _, err = DecodeItem(data)
+		}
+
 		if err != nil {
 			return nil, err
 		}
