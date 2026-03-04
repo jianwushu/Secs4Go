@@ -13,6 +13,11 @@ import (
 
 var ErrTimeoutT3 = errors.New("T3 reply timeout")
 
+type replyResult struct {
+	data []byte
+	err  error
+}
+
 // ============================================================
 // SecsGem - SECS/GEM 应用层封装
 // 职责: 封装 HSMSTransport，提供简洁的应用层 API 仅处理数据消息（Message）的发送
@@ -26,13 +31,16 @@ type SecsGem struct {
 	logger     Logger
 	mu         sync.RWMutex
 
+	done      chan struct{}
+	closeOnce sync.Once
+
 	// 回调
 	msgHandler func(*Message) // 数据消息处理回调
 
 	itemCodec *ItemCodec // 编解码器
 
 	// 独立收发机制：使用 SystemBytes 关联请求和回复
-	pendingReplies sync.Map // map[uint32]chan []byte
+	pendingReplies sync.Map // map[uint32]chan replyResult
 }
 
 // NewSecsGem 创建会话
@@ -50,6 +58,7 @@ func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport
 		transport:  hsmsConnection,
 		logger:     logger,
 		itemCodec:  codec,
+		done:       make(chan struct{}),
 	}
 	// 设置数据消息回调（所有数据会话由 secsgem 统一处理）
 	hsmsConnection.OnMessage(secsGem.handleDataMessage)
@@ -61,6 +70,26 @@ func (s *SecsGem) OnMessage(handler func(*Message)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.msgHandler = handler
+}
+
+// Close 关闭会话：终止所有等待回复的任务（T3）
+// 注意：Close 不会自动停止底层 transport；如需断开连接，请调用 transport.Stop()
+func (s *SecsGem) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+	})
+	s.cancelPendingReplies(ErrNotConnected)
+}
+
+func (s *SecsGem) cancelPendingReplies(err error) {
+	s.pendingReplies.Range(func(_, v any) bool {
+		ch := v.(chan replyResult)
+		select {
+		case ch <- replyResult{err: err}:
+		default:
+		}
+		return true
+	})
 }
 
 // ============================================================
@@ -92,7 +121,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 无需回复的消息
 	if !msg.WBit {
 		if err := s.transport.Send(frameData); err != nil {
-			return nil, fmt.Errorf("send failed: %v", err)
+			return nil, fmt.Errorf("send failed: %w", err)
 		}
 		return nil, nil
 	}
@@ -100,7 +129,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 需要回复的消息
 	replyData, err := s.sendAndWait(frameData, header)
 	if err != nil {
-		return nil, fmt.Errorf("send failed: %v", err)
+		return nil, fmt.Errorf("send failed: %w", err)
 	}
 
 	// 解析回复
@@ -149,17 +178,12 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 	systemBytes := header.SystemBytes
 
 	// 创建回复通道
-	replyChan := make(chan []byte, 1)
+	replyChan := make(chan replyResult, 1)
 	s.pendingReplies.Store(systemBytes, replyChan)
 
 	// 确保清理
 	defer func() {
 		s.pendingReplies.Delete(systemBytes)
-		// 防止 goroutine 泄漏：发送空数据唤醒可能阻塞的发送方
-		select {
-		case replyChan <- nil:
-		default:
-		}
 	}()
 
 	// 发送
@@ -168,11 +192,21 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 		return nil, err
 	}
 
+	timer := time.NewTimer(s.config.T3)
+	defer timer.Stop()
+
 	// 等待回复或超时 (T3)
 	select {
-	case data := <-replyChan:
-		return data, nil
-	case <-time.After(s.config.T3):
+	case res := <-replyChan:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.data, nil
+	case <-s.done:
+		return nil, ErrNotConnected
+	case <-s.transport.ConnDone():
+		return nil, ErrNotConnected
+	case <-timer.C:
 		s.logger.Error("Timeout waiting for reply (T3=%v) (SysBytes=%d)", s.config.T3, systemBytes)
 		return nil, ErrTimeoutT3
 	}
@@ -191,7 +225,7 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 
 	// 如果是回复消息（WBit=false），查找等待的请求并发送回复数据
 	if !msg.WBit {
-		s.handleReply(msg.SystemBytes, nil)
+		s.handleReply(msg.SystemBytes, itemData)
 		return
 	}
 
@@ -210,7 +244,7 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 func (s *SecsGem) handleReply(systemBytes uint32, itemData []byte) {
 	if ch, ok := s.pendingReplies.Load(systemBytes); ok {
 		select {
-		case ch.(chan []byte) <- itemData:
+		case ch.(chan replyResult) <- replyResult{data: itemData}:
 		default:
 		}
 	}

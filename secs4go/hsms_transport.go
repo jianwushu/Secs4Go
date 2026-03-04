@@ -42,6 +42,11 @@ type HSMSTransport struct {
 	// 消息信道
 	controlReplyChan chan struct{} // 控制回复信道 (T6)
 
+	// 连接生命周期（每次建立/断开连接都会轮转）
+	// ConnDone 在连接断开或 Stop/Close 时关闭，用于中断等待（T3/T6 等）
+	connDone     chan struct{}
+	connDoneOnce sync.Once
+
 	// 生命周期控制
 	stopChan      chan struct{} // 停止信号通道（每次 Start/Stop 生命周期都会重建）
 	stopOnce      sync.Once
@@ -60,12 +65,16 @@ type HSMSTransport struct {
 
 // NewHSMSTransport 创建传输层
 func NewHSMSTransport(config *Config) *HSMSTransport {
+	// 初始为 disconnected：不预先塞一个“已关闭”的 connDone。
+	// 否则后续断连/Stop 时再次 close 会触发 panic: close of closed channel。
+	// 当 connDone == nil 时，ConnDone() 会返回一个临时的已关闭通道，供等待方立即退出。
 	return &HSMSTransport{
 		config:           config,
 		state:            StateDisconnected,
 		t6Timer:          time.NewTimer(config.T6),
 		t7Timer:          time.NewTimer(config.T7),
 		controlReplyChan: make(chan struct{}, 1),
+		connDone:         nil,
 		stopChan:         make(chan struct{}),
 		reconnectChan:    make(chan struct{}, 1),
 		readyChan:        make(chan struct{}),
@@ -183,6 +192,42 @@ func (t *HSMSTransport) Stop() {
 // ReadyChan 返回就绪通道 (Select完成时发送信号)
 func (t *HSMSTransport) ReadyChan() <-chan struct{} {
 	return t.readyChan
+}
+
+// ConnDone 返回连接断开信号（连接断开 / Stop / Close 时关闭）
+func (t *HSMSTransport) ConnDone() <-chan struct{} {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.connDone == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return t.connDone
+}
+
+// resetConnDoneLocked 重建连接生命周期通道（必须在持锁状态下调用）
+func (t *HSMSTransport) resetConnDoneLocked() {
+	// 先关闭旧的（如果还没关闭），避免遗留等待
+	if t.connDone != nil {
+		t.closeConnDoneLocked()
+	}
+	t.connDone = make(chan struct{})
+	t.connDoneOnce = sync.Once{}
+}
+
+// closeConnDoneLocked 关闭连接生命周期通道（必须在持锁状态下调用）
+func (t *HSMSTransport) closeConnDoneLocked() {
+	// connDone == nil 表示当前没有可用的连接生命周期通道。
+	// ConnDone() 在 nil 时会返回一个“已关闭”的临时通道，因此这里无需创建/关闭新通道。
+	// 否则会出现：t.connDone 被赋值为“已关闭通道”，但 connDoneOnce 尚未标记执行，
+	// 后续再次 closeConnDoneLocked() 会二次 close 触发 panic。
+	if t.connDone == nil {
+		return
+	}
+	t.connDoneOnce.Do(func() {
+		close(t.connDone)
+	})
 }
 
 // ReconnectChan 返回重连通道 (供外部触发重连)
@@ -307,6 +352,8 @@ func (t *HSMSTransport) Connect(address string) error {
 	}
 
 	t.conn = conn
+	// 新连接生命周期：重建 connDone（保持打开状态，断连时再关闭）
+	t.resetConnDoneLocked()
 
 	// T7: 启动 Not Selected 超时
 	t.resetT7Locked()
@@ -390,6 +437,8 @@ func (t *HSMSTransport) Accept() error {
 		t.listener = nil
 	}
 	t.conn = conn
+	// 新连接生命周期：重建 connDone（保持打开状态，断连时再关闭）
+	t.resetConnDoneLocked()
 	t.state = StateConnected
 	t.mu.Unlock()
 
@@ -528,6 +577,10 @@ func (t *HSMSTransport) SendControlAndWait(header HSMSHeader) error {
 
 	// 等待 T6 超时或回复
 	select {
+	case <-t.stopChan:
+		return ErrNotConnected
+	case <-t.ConnDone():
+		return ErrNotConnected
 	case <-t.t6Timer.C:
 		return ErrTimeoutT6
 	case <-t.controlReplyChan:
@@ -618,6 +671,8 @@ func (t *HSMSTransport) closeResources() {
 	listener := t.listener
 	t.conn = nil
 	t.listener = nil
+	// 关闭连接生命周期信号，确保所有等待（T3/T6 等）立即退出
+	t.closeConnDoneLocked()
 	t.mu.Unlock()
 
 	if conn != nil {
@@ -853,6 +908,8 @@ func (t *HSMSTransport) handleDisconnect() {
 	}
 	prevState := t.state
 	t.state = StateDisconnected
+	// 关闭连接生命周期信号，确保等待立即退出
+	t.closeConnDoneLocked()
 	t.mu.Unlock()
 
 	// 停止所有定时器

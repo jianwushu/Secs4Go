@@ -72,7 +72,8 @@ func (s SType) String() string {
 	case STypeSeparateReq:
 		return "Separate.req"
 	default:
-		return fmt.Sprintf("Unknown(0x%02X)", s)
+		// 注意：这里不能直接用 %X/%v 打印 s（会触发 fmt 调用 s.String() 造成递归）。
+		return fmt.Sprintf("Unknown(0x%02X)", uint8(s))
 	}
 }
 
