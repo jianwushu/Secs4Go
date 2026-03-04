@@ -89,6 +89,7 @@ const (
 	StateConnected                           // TCP已连接 (Not Selected)
 	StateSelected                            // 已完成Select
 	StateReconnecting                        // 重连中
+	StateListening                           // 服务端端口已监听，但尚未 Accept 到 TCP 连接
 )
 
 func (s ConnectionState) String() string {
@@ -103,6 +104,8 @@ func (s ConnectionState) String() string {
 		return "Selected"
 	case StateReconnecting:
 		return "Reconnecting"
+	case StateListening:
+		return "Listening"
 	default:
 		return fmt.Sprintf("Unknown(%d)", s)
 	}

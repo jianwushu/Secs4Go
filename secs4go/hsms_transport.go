@@ -43,7 +43,9 @@ type HSMSTransport struct {
 	controlReplyChan chan struct{} // 控制回复信道 (T6)
 
 	// 生命周期控制
-	stopChan      chan struct{} // 停止信号通道
+	stopChan      chan struct{} // 停止信号通道（每次 Start/Stop 生命周期都会重建）
+	stopOnce      sync.Once
+	stopping      bool
 	reconnectChan chan struct{} // 重连信号通道
 	readyChan     chan struct{} // 就绪信号通道 (Select完成)
 
@@ -76,17 +78,15 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 
 // Start 启动传输层 (根据 IsActive 自动选择客户端或服务端模式)
 func (t *HSMSTransport) Start() error {
-	// 服务端模式：检查是否需要重置状态（支持二次启动）
-	if !t.config.IsActive {
-		t.mu.Lock()
-		if t.state == StateDisconnected {
-			// 重置 stopChan（创建新的通道实例以支持二次启动）
-			t.stopChan = make(chan struct{})
-			// 预置状态为 Connected，表示即将开始监听
-			t.state = StateConnected
-		}
-		t.mu.Unlock()
+	// 新一轮生命周期初始化（支持 Stop() 后再次 Start()）
+	t.mu.Lock()
+	if t.state == StateDisconnected {
+		t.stopChan = make(chan struct{})
+		t.stopOnce = sync.Once{}
+		t.readyChan = make(chan struct{})
+		t.stopping = false
 	}
+	t.mu.Unlock()
 
 	if t.config.IsActive {
 		// 客户端模式: 连接并启动后台协程
@@ -116,57 +116,67 @@ func (t *HSMSTransport) Start() error {
 			t.wg.Add(1)
 			go t.heartbeatLoop()
 		}
-	} else {
-		// 服务端模式: 监听
-		t.logger.Info("Starting transport (passive mode)...")
+		return nil
+	}
 
-		if err := t.Listen(t.config.Address); err != nil {
-			return fmt.Errorf("failed to listen: %v", err)
-		}
-		t.logger.Info("Listening on %s", t.LocalAddr())
+	// 服务端模式: 监听
+	t.logger.Info("Starting transport (passive mode)...")
 
-		// 启动连接处理协程 (Accept 后每个连接会启动 receiveLoop)
+	if err := t.Listen(t.config.Address); err != nil {
+		return fmt.Errorf("failed to listen: %v", err)
+	}
+	t.logger.Info("Listening on %s", t.LocalAddr())
+
+	// 启动连接处理协程 (Accept 后每个连接会启动 receiveLoop)
+	t.wg.Add(1)
+	go t.handleConnections()
+
+	// 启动心跳检测（服务端模式也启用）
+	if t.config.EnableHeartbeat {
 		t.wg.Add(1)
-		go t.handleConnections()
-
-		// 启动心跳检测（服务端模式也启用）
-		if t.config.EnableHeartbeat {
-			t.wg.Add(1)
-			go t.heartbeatLoop()
-		}
+		go t.heartbeatLoop()
 	}
 
 	return nil
 }
 
-// Stop 停止传输层
+// Stop 停止传输层（幂等；支持 Stop() 后再次 Start()）
 func (t *HSMSTransport) Stop() {
-	// 检查是否已选择（连接成功状态）
-	t.mu.RLock()
-	isSelected := t.state == StateSelected
+	// 标记 stopping（避免 Stop 过程中触发 passive 重开监听 / active 自动重连）
+	t.mu.Lock()
+	if !t.stopping {
+		t.stopping = true
+	}
 	currentState := t.state
-	t.mu.RUnlock()
+	isSelected := currentState == StateSelected
+	t.mu.Unlock()
 
-	// 优先发送 Separate.req 让对方知晓断开
+	// 优先发送 Separate.req 让对方知晓断开（失败忽略）
 	if isSelected {
-		t.SendSeparateReq()
+		_ = t.SendSeparateReq()
 	}
 
-	// 发送停止信号（先关闭 stopChan，让协程退出）
-	t.mu.Lock()
-	close(t.stopChan)
-	t.mu.Unlock()
+	// 发出停止信号（幂等）
+	t.stopOnce.Do(func() {
+		close(t.stopChan)
+	})
+
+	// 先关闭底层资源以打断 Accept/read
+	t.closeResources()
 
 	// 等待所有协程退出
 	t.wg.Wait()
 
-	// 在关闭连接前触发状态变更事件
-	if currentState == StateSelected || currentState == StateConnected {
-		t.notifyStateChange(currentState, StateDisconnected)
+	// 收敛状态并仅通知一次
+	t.mu.Lock()
+	prevState := t.state
+	t.state = StateDisconnected
+	t.mu.Unlock()
+
+	if prevState != StateDisconnected {
+		t.notifyStateChange(prevState, StateDisconnected)
 	}
 
-	// 关闭连接
-	t.Close()
 	t.logger.Info("Transport stopped")
 }
 
@@ -324,41 +334,68 @@ func (t *HSMSTransport) Connect(address string) error {
 // 服务端方法
 // ============================================================
 
-// Listen 服务端: 监听连接
+// Listen 服务端: 监听连接（进入 Listening 状态）
 func (t *HSMSTransport) Listen(address string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// 如果已停止，直接返回错误（避免 Stop() 后又把端口 listen 起来）
+	select {
+	case <-t.stopChan:
+		return net.ErrClosed
+	default:
+	}
 
+	t.mu.Lock()
 	// 关闭旧监听器
 	if t.listener != nil {
-		t.listener.Close()
+		_ = t.listener.Close()
+		t.listener = nil
 	}
 
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
+		t.mu.Unlock()
 		return err
 	}
 
+	prevState := t.state
 	t.listener = listener
 	t.conn = nil // 清空旧连接
-	t.state = StateConnected
+	t.state = StateListening
+	t.mu.Unlock()
+
+	if prevState != StateListening {
+		t.notifyStateChange(prevState, StateListening)
+	}
 	return nil
 }
 
 // Accept 服务端: 接受连接 (单连接模式：关闭监听器，将连接设置到自身)
 func (t *HSMSTransport) Accept() error {
-	conn, err := t.listener.Accept()
+	t.mu.RLock()
+	listener := t.listener
+	t.mu.RUnlock()
+	if listener == nil {
+		return net.ErrClosed
+	}
+
+	conn, err := listener.Accept()
 	if err != nil {
 		return err
 	}
 
-	// 关闭监听器
-	t.listener.Close()
-	t.listener = nil
-
-	// 设置连接
+	// 关闭监听器（单连接模式）并设置连接
+	t.mu.Lock()
+	prevState := t.state
+	if t.listener != nil {
+		_ = t.listener.Close()
+		t.listener = nil
+	}
 	t.conn = conn
 	t.state = StateConnected
+	t.mu.Unlock()
+
+	if prevState != StateConnected {
+		t.notifyStateChange(prevState, StateConnected)
+	}
 
 	// T7: 启动 Not Selected 超时
 	t.resetT7()
@@ -380,10 +417,22 @@ func (t *HSMSTransport) handleConnections() {
 		default:
 		}
 
-		// 打开监听器
-		if err := t.Listen(t.config.Address); err != nil {
-			t.logger.Error("Failed to listen: %v", err)
-			return
+		// 若尚未处于监听状态，则打开监听器
+		t.mu.RLock()
+		listener := t.listener
+		state := t.state
+		t.mu.RUnlock()
+		if listener == nil || state != StateListening {
+			if err := t.Listen(t.config.Address); err != nil {
+				select {
+				case <-t.stopChan:
+					return
+				default:
+					t.logger.Error("Failed to listen: %v", err)
+					return
+				}
+			}
+			t.logger.Info("Listening on %s", t.LocalAddr())
 		}
 
 		// 等待 Accept（阻塞）
@@ -392,6 +441,10 @@ func (t *HSMSTransport) handleConnections() {
 			case <-t.stopChan:
 				return
 			default:
+				// listener 被 Stop() 关闭时，Accept 会报错；这里不当作业务错误
+				if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") {
+					continue
+				}
 				t.logger.Error("Failed to accept connection: %v", err)
 				continue
 			}
@@ -553,38 +606,34 @@ func (t *HSMSTransport) LocalAddr() net.Addr {
 	return nil
 }
 
-// Close 关闭连接
-func (t *HSMSTransport) Close() {
-	t.mu.Lock()
-	prevState := t.state
-	// 先检查是否已断开，避免重复处理
-	if prevState == StateDisconnected {
-		t.mu.Unlock()
-		return
-	}
-	// 再设置状态为断开
-	t.state = StateDisconnected
-	t.mu.Unlock()
-
+// closeResources 关闭底层资源（listener/conn/timers），不修改 state、不触发回调
+func (t *HSMSTransport) closeResources() {
 	// 停止所有定时器
 	t.t6Timer.Stop()
 	t.t7Timer.Stop()
 
-	// 关闭连接
+	// 取出资源引用，避免在持锁状态下做 Close() 阻塞
 	t.mu.Lock()
-	if t.conn != nil {
-		t.conn.Close()
-		t.conn = nil
-	}
+	conn := t.conn
+	listener := t.listener
+	t.conn = nil
+	t.listener = nil
 	t.mu.Unlock()
 
-	// 通知 listener 关闭（如果有）
-	t.mu.Lock()
-	if t.listener != nil {
-		t.listener.Close()
-		t.listener = nil
+	if conn != nil {
+		_ = conn.Close()
 	}
+	if listener != nil {
+		_ = listener.Close()
+	}
+}
+
+// Close 关闭连接（资源关闭 + 状态置为 Disconnected；不触发回调）
+func (t *HSMSTransport) Close() {
+	t.mu.Lock()
+	t.state = StateDisconnected
 	t.mu.Unlock()
+	t.closeResources()
 }
 
 // ============================================================
@@ -689,31 +738,39 @@ func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 	case STypeSelectRsp:
 		t.t7Timer.Stop()
 		t.mu.Lock()
+		prevState := t.state
 		if header.HeaderByte3 == 0x00 {
 			t.state = StateSelected
-			t.notifySelected()
 		}
 		t.mu.Unlock()
+		if header.HeaderByte3 == 0x00 {
+			t.notifyStateChange(prevState, StateSelected)
+			t.notifySelected()
+		}
 
 	case STypeSelectReq: // 服务端收到 Select.req
 		t.sendSelectRsp(header.SystemBytes, 0x00)
 		t.mu.Lock()
+		prevState := t.state
 		t.state = StateSelected
 		t.mu.Unlock()
-		t.notifyStateChange(StateConnected, StateSelected)
+		t.notifyStateChange(prevState, StateSelected)
+		t.notifySelected()
 
 	case STypeDeselectRsp:
 		t.mu.Lock()
+		prevState := t.state
 		t.state = StateConnected
 		t.mu.Unlock()
-		t.notifyStateChange(StateSelected, StateConnected)
+		t.notifyStateChange(prevState, StateConnected)
 
 	case STypeDeselectReq: // 服务端收到 Deselect.req
 		t.sendDeselectRsp(header.SystemBytes, 0x00)
 		t.mu.Lock()
+		prevState := t.state
 		t.state = StateConnected
 		t.mu.Unlock()
-		t.notifyStateChange(StateSelected, StateConnected)
+		t.notifyStateChange(prevState, StateConnected)
 
 	case STypeLinktestReq: // 自动回复 LinkTest.rsp
 		t.sendLinkTestRsp(header.SystemBytes)
@@ -776,6 +833,19 @@ func (t *HSMSTransport) resetT7Locked() {
 
 // handleDisconnect 处理断开连接
 func (t *HSMSTransport) handleDisconnect() {
+	// Stop() 过程中不做断开处理，避免重开监听/触发重连
+	t.mu.RLock()
+	stopping := t.stopping
+	t.mu.RUnlock()
+	if stopping {
+		return
+	}
+	select {
+	case <-t.stopChan:
+		return
+	default:
+	}
+
 	t.mu.Lock()
 	if t.state == StateDisconnected {
 		t.mu.Unlock()
@@ -792,7 +862,7 @@ func (t *HSMSTransport) handleDisconnect() {
 	// 关闭连接
 	t.mu.Lock()
 	if t.conn != nil {
-		t.conn.Close()
+		_ = t.conn.Close()
 		t.conn = nil
 	}
 	t.mu.Unlock()
@@ -805,13 +875,6 @@ func (t *HSMSTransport) handleDisconnect() {
 		// 重新启动 handleConnections 协程
 		t.wg.Add(1)
 		go t.handleConnections()
-	}
-
-	// 检查是否已停止（避免 Stop() 时重复触发重连）
-	select {
-	case <-t.stopChan:
-		return
-	default:
 	}
 
 	// 客户端模式：触发自动重连
