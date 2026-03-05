@@ -74,18 +74,22 @@ func (s *SecsGem) OnMessage(handler func(*Message)) {
 
 // Close 关闭会话：终止所有等待回复的任务（T3）
 // 注意：Close 不会自动停止底层 transport；如需断开连接，请调用 transport.Stop()
+//
+// 语义约定：Close/断线导致的“等待回复取消”被视为“无回复”，因此不会返回错误。
+// 这会吞掉断线错误（可能导致丢消息）；如果上层需要重试/告警，请不要使用该语义。
 func (s *SecsGem) Close() {
 	s.closeOnce.Do(func() {
 		close(s.done)
 	})
-	s.cancelPendingReplies(ErrNotConnected)
+	// 唤醒所有等待 reply 的 goroutine：投递一个空结果（err=nil, data=nil），使其按“无回复”返回。
+	s.cancelPendingReplies(nil)
 }
 
 func (s *SecsGem) cancelPendingReplies(err error) {
 	s.pendingReplies.Range(func(_, v any) bool {
 		ch := v.(chan replyResult)
 		select {
-		case ch <- replyResult{err: err}:
+		case ch <- replyResult{data: nil, err: err}:
 		default:
 		}
 		return true
@@ -203,9 +207,11 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 		}
 		return res.data, nil
 	case <-s.done:
-		return nil, ErrNotConnected
+		// 会话关闭：视为无回复
+		return nil, nil
 	case <-s.transport.ConnDone():
-		return nil, ErrNotConnected
+		// 连接断开：视为无回复
+		return nil, nil
 	case <-timer.C:
 		s.logger.Error("Timeout waiting for reply (T3=%v) (SysBytes=%d)", s.config.T3, systemBytes)
 		return nil, ErrTimeoutT3
