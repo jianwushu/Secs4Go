@@ -83,12 +83,12 @@ func (l *defaultLogger) Error(format string, args ...interface{}) {
 // ============================================================
 
 type fileLogger struct {
-	logger     *log.Logger
-	level      LogLevel
-	file       *os.File
+	logger      *log.Logger
+	level       LogLevel
+	file        *os.File
 	currentHour int
-	mu         sync.Mutex
-	logDir     string
+	mu          sync.Mutex
+	logDir      string
 }
 
 // NewFileLogger 创建设备名称指定的文件logger
@@ -127,11 +127,11 @@ func NewFileLoggerWithLevel(deviceName string, level LogLevel) Logger {
 	logger := log.New(multiWriter, "", log.LstdFlags|log.Lmicroseconds)
 
 	return &fileLogger{
-		logger:       logger,
-		level:        level,
-		file:         file,
-		currentHour:  currentTime.Hour(),
-		logDir:       logDir,
+		logger:      logger,
+		level:       level,
+		file:        file,
+		currentHour: currentTime.Hour(),
+		logDir:      logDir,
 	}
 }
 
@@ -220,7 +220,7 @@ func (l *fileLogger) Close() error {
 }
 
 // ============================================================
-// 静默Logger(用于测试)
+// 静默Logger
 // ============================================================
 
 type silentLogger struct{}

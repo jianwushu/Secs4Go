@@ -56,6 +56,10 @@ func DefaultConfig(address string) *Config {
 
 // Validate 验证配置
 func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+
 	if c.Address == "" {
 		return fmt.Errorf("address is required")
 	}

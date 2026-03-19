@@ -1,12 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/jianwushu/Secs4go/secs4go"
 )
@@ -14,29 +14,31 @@ import (
 // SecsServer SECS-I/GEM服务端示例
 // 职责: 创建会话、设置消息处理回调、处理业务消息
 
-const (
-	ListenAddress = ":5000"
-	DeviceID      = 0 // 设备ID
-)
-
 var server *secs4go.SecsGem
 
 func main() {
+	opts, err := parseServerOptions(os.Args[1:])
+	if err != nil {
+		log.Fatalf("解析服务端参数失败: %v", err)
+	}
+
 	// 1. 创建配置（服务端模式）
-	config := secs4go.DefaultConfig(ListenAddress)
-	config.T3 = 10 * time.Second
-	config.DeviceID = DeviceID
-	config.IsActive = false
-	config.EnableHeartbeat = false
+	config := buildServerConfig(opts)
 
 	hsmsConnection := secs4go.NewHSMSTransport(config)
 
 	hsmsConnection.OnStateChange(handleStateChange)
 
-	codec, _ := secs4go.NewItemCodec(config.ItemAEncoding)
+	codec, err := secs4go.NewItemCodec(config.ItemAEncoding)
+	if err != nil {
+		log.Fatalf("创建编解码器失败: %v", err)
+	}
 
-	// 2. 创建会话
-	server = secs4go.NewSecsGem("Host", config, hsmsConnection, nil, codec)
+	// 2. 创建 logger（按日志级别写入文件）
+	logger := secs4go.NewFileLoggerWithLevel("Host", parseLogLevel(opts.LogLevel))
+
+	// 3. 创建会话
+	server = secs4go.NewSecsGem("Host", config, hsmsConnection, logger, codec)
 
 	// 3. 设置消息处理回调
 	server.OnMessage(handleMessage)
@@ -45,9 +47,13 @@ func main() {
 	if err := hsmsConnection.Start(); err != nil {
 		log.Fatalf("启动失败: %v", err)
 	}
-	log.Printf("服务端已启动，监听: %s", ListenAddress)
+	log.Printf("服务端已启动，监听: %s, 事件周期: %s", config.Address, opts.EventInterval)
 
-	go testSendMessage()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// publisher := newEventPublisher(opts, server)
+	// go publisher.run(ctx)
 
 	// 6. 等待退出信号
 	sigChan := make(chan os.Signal, 1)
@@ -55,6 +61,7 @@ func main() {
 	<-sigChan
 
 	// 7. 停止会话
+	cancel()
 	hsmsConnection.Stop()
 	log.Printf("服务端已停止")
 }
@@ -105,6 +112,15 @@ func handleMessage(msg *secs4go.Message) {
 		if err := server.SendReply(msg, reply); err != nil {
 			log.Printf("发送S2F36失败: %v", err)
 		}
+	case "S2F37":
+		log.Printf("收到 S2F37, 发送 S2F38 回复")
+		reply, err := HandleS2F37(msg.Item)
+		if err != nil {
+			log.Printf("处理S2F37失败: %v", err)
+		}
+		if err := server.SendReply(msg, reply); err != nil {
+			log.Printf("发送S2F38失败: %v", err)
+		}
 	default:
 		server.SendDefaultReply(msg)
 	}
@@ -114,33 +130,16 @@ func handleStateChange(oldState, newState secs4go.ConnectionState) {
 	log.Printf("状态变更: %s -> %s", oldState, newState)
 }
 
-func testSendMessage() {
-
-	i := 10
-
-	for {
-		if server.IsSelected() {
-
-			i = i + 1
-			UpdateDv("1001", fmt.Sprintf("CRR_好_%d", i))
-
-			time.Sleep(1 * time.Second)
-
-			go func() {
-				msg, err := Trigger10020()
-				if err != nil {
-					log.Printf("触发10020失败: %v", err)
-					return
-				}
-				_, err = server.Send(msg)
-				if err != nil {
-					log.Printf("S6F11 失败: %v", err)
-				}
-
-			}()
-
-			time.Sleep(45 * time.Second)
-		}
+// parseLogLevel 将字符串日志级别转换为 secs4go.LogLevel
+func parseLogLevel(level string) secs4go.LogLevel {
+	switch level {
+	case "debug":
+		return secs4go.LogLevelDebug
+	case "warn":
+		return secs4go.LogLevelWarn
+	case "error":
+		return secs4go.LogLevelError
+	default:
+		return secs4go.LogLevelInfo
 	}
-
 }

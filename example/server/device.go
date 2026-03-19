@@ -2,28 +2,33 @@ package main
 
 import (
 	"fmt"
-	"strconv"
+	"sync"
 
 	"github.com/jianwushu/Secs4go/secs4go"
 )
 
-// 变量声明
+// deviceMu 保护共享设备状态 map 的并发读写
+var deviceMu sync.RWMutex
+
+// SVID 状态变量
 type SVID struct {
 	name  string
-	value interface{} // A Ux Ix
+	value interface{} // string / int / float64 / bool
 	unit  string
 }
 
 func (v *SVID) ValueToString() string {
+	// 注意：多类型 case 中 val 类型为 interface{}，直接 fmt.Sprint 最安全
 	switch val := v.value.(type) {
 	case string:
 		return val
-	case int, int16, int32, int64:
-		return fmt.Sprint(val.(int64))
 	case float64:
-		return strconv.FormatFloat(val, 'f', -1, 64)
+		return fmt.Sprintf("%g", val)
 	case bool:
-		return strconv.FormatBool(val)
+		if val {
+			return "true"
+		}
+		return "false"
 	default:
 		return fmt.Sprint(val)
 	}
@@ -57,6 +62,7 @@ type ReportLink struct {
 }
 
 var (
+	// SvMap 状态变量表 (Status Variables)
 	SvMap = map[string]SVID{
 		"2001": {"ControlState", 0, ""},
 		"2002": {"RunState", 0, ""},
@@ -67,457 +73,450 @@ var (
 		"2007": {"MC Name", "HH", ""},
 		"2008": {"MC Version", "v1.0.0", ""},
 	}
+	// DvMap 数据变量表 (Data Variables)
 	DvMap = map[string]DVID{
-		"1001": {"CRR_START_ID", "t"},
-		"1002": {"CRR_START_TIME", "tt"},
+		"1001": {"CRR_START_ID", ""},
+		"1002": {"CRR_START_TIME", ""},
 		"1003": {"CRR_END_ID", ""},
 		"1004": {"CRR_END_TIME", ""},
 		"1005": {"CRR_IN_MAP", ""},
 		"1006": {"CRR_OUT_MAP", ""},
 	}
+	// EvMap 设备常量表 (Equipment Constants)，min/max/def 使用 float32
 	EvMap = map[string]ECID{
-		"3001": {"T3", 45, 45, 45, 45, "s"},
-		"3002": {"T5", 10, 10, 10, 10, "s"},
+		"3001": {"T3", float32(45), float32(45), float32(45), float32(45), "s"},
+		"3002": {"T5", float32(10), float32(10), float32(10), float32(10), "s"},
 	}
-
+	// EventLinks 事件-报告关联表
 	EventLinks = map[string]EventLink{
 		"10020": {true, []string{"10020"}},
 	}
-
+	// ReportLinks 报告-变量关联表
 	ReportLinks = map[string]ReportLink{
 		"10020": {[]string{"1001", "1002"}},
 	}
 )
 
-// Are You There Request (R)
+// parseUintIDs 从 List 类型 Item 中安全解析整数 ID 列表（支持 U2/U4/I2）
+func parseUintIDs(item *secs4go.Item) []string {
+	if !item.IsList() {
+		return nil
+	}
+	ids := make([]string, 0, item.GetLength())
+	for i := 0; i < item.GetLength(); i++ {
+		child := item.GetItem(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type {
+		case secs4go.TypeUInt16:
+			if v, ok := child.Value.([]uint16); ok && len(v) > 0 {
+				ids = append(ids, fmt.Sprint(v[0]))
+			}
+		case secs4go.TypeUInt32:
+			if v, ok := child.Value.([]uint32); ok && len(v) > 0 {
+				ids = append(ids, fmt.Sprint(v[0]))
+			}
+		case secs4go.TypeInt16:
+			if v, ok := child.Value.([]int16); ok && len(v) > 0 {
+				ids = append(ids, fmt.Sprint(v[0]))
+			}
+		default:
+			ids = append(ids, fmt.Sprint(child.Value))
+		}
+	}
+	return ids
+}
+
+// parseFirstUint 从单个数值 Item 中安全解析第一个整数，返回字符串形式
+func parseFirstUint(item *secs4go.Item) string {
+	if item == nil {
+		return ""
+	}
+	switch item.Type {
+	case secs4go.TypeUInt16:
+		if v, ok := item.Value.([]uint16); ok && len(v) > 0 {
+			return fmt.Sprint(v[0])
+		}
+	case secs4go.TypeUInt32:
+		if v, ok := item.Value.([]uint32); ok && len(v) > 0 {
+			return fmt.Sprint(v[0])
+		}
+	case secs4go.TypeInt16:
+		if v, ok := item.Value.([]int16); ok && len(v) > 0 {
+			return fmt.Sprint(v[0])
+		}
+	}
+	return fmt.Sprint(item.Value)
+}
+
+// svName 安全获取 SvMap 中的字符串字段（避免直接类型断言 panic）
+func svName(key string) string {
+	deviceMu.RLock()
+	sv, ok := SvMap[key]
+	deviceMu.RUnlock()
+	if !ok {
+		return ""
+	}
+	if s, ok := sv.value.(string); ok {
+		return s
+	}
+	return fmt.Sprint(sv.value)
+}
+
+// Are You There Request (R)  →  S1F2
 func HandleS1F1(item *secs4go.Item) *secs4go.Message {
 	return secs4go.NewMessage(1, 2).WithItem(secs4go.L(
-		secs4go.A(SvMap["2007"].value.(string)),
-		secs4go.A(SvMap["2008"].value.(string)),
+		secs4go.A(svName("2007")),
+		secs4go.A(svName("2008")),
 	))
 }
 
-// Selected Equipment Status Request (SSR)
+// Selected Equipment Status Request (SSR)  →  S1F4
 func HandleS1F3(item *secs4go.Item) *secs4go.Message {
+	svList := parseUintIDs(item)
 
-	// 解析S1F3数据
-	var svList []string
-	if item.IsList() {
-		for i := 0; i < item.GetLength(); i++ {
-			child := item.GetItem(i)
-			switch child.Type {
-			case secs4go.TypeUInt16:
-				svList = append(svList, fmt.Sprint(child.Value.([]uint16)[0]))
-			case secs4go.TypeUInt32:
-				svList = append(svList, fmt.Sprint(child.Value.([]uint32)[0]))
-			default:
-				svList = append(svList, fmt.Sprint(child.Value.([]int16)[0]))
-			}
-		}
-	}
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 
-	// 构建S1F4返回数据
-	var replyVidVals []*secs4go.Item
+	var vals []*secs4go.Item
 	if len(svList) == 0 {
-		for _, vid := range SvMap {
-			replyVidVals = append(replyVidVals, secs4go.A(vid.ValueToString()))
+		for _, sv := range SvMap {
+			vals = append(vals, secs4go.A(sv.ValueToString()))
 		}
 	} else {
-		for _, sv := range svList {
-			if vid, ok := SvMap[sv]; ok {
-				replyVidVals = append(replyVidVals, secs4go.A(vid.ValueToString()))
+		for _, id := range svList {
+			if sv, ok := SvMap[id]; ok {
+				vals = append(vals, secs4go.A(sv.ValueToString()))
 			} else {
-				replyVidVals = append(replyVidVals, secs4go.L())
+				vals = append(vals, secs4go.L()) // 未知 SVID 返回空列表
 			}
 		}
 	}
-
-	if len(replyVidVals) != 0 {
-		return secs4go.NewMessage(1, 4).WithItem(secs4go.L(replyVidVals...))
-	}
-
-	return secs4go.NewMessage(1, 4).WithItem(secs4go.L())
+	return secs4go.NewMessage(1, 4).WithItem(secs4go.L(vals...))
 }
 
-// Status Variable Namelist Request (SVNR)
+// Status Variable Namelist Request (SVNR)  →  S1F12
 func HandleS1F11(item *secs4go.Item) *secs4go.Message {
+	svList := parseUintIDs(item)
 
-	// 解析S1F11数据
-	var svList []string
-	if item.IsList() {
-		for i := 0; i < item.GetLength(); i++ {
-			child := item.GetItem(i)
-			switch child.Type {
-			case secs4go.TypeUInt16:
-				svList = append(svList, fmt.Sprint(child.Value.([]uint16)[0]))
-			case secs4go.TypeUInt32:
-				svList = append(svList, fmt.Sprint(child.Value.([]uint32)[0]))
-			default:
-				svList = append(svList, fmt.Sprint(child.Value.([]int16)[0]))
-			}
-		}
-	}
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 
-	// 构建S1F12返回数据
-	var replyVidVals []*secs4go.Item
+	var entries []*secs4go.Item
 	if len(svList) == 0 {
-		for key, vid := range SvMap {
-			replyVidVals = append(replyVidVals, secs4go.L(
+		for key, sv := range SvMap {
+			entries = append(entries, secs4go.L(
 				secs4go.U4(String2UInt32(key)),
-				secs4go.A(vid.name),
-				secs4go.A(vid.unit),
+				secs4go.A(sv.name),
+				secs4go.A(sv.unit),
 			))
 		}
 	} else {
-		for _, sv := range svList {
-			if vid, ok := SvMap[sv]; ok {
-				replyVidVals = append(replyVidVals, secs4go.L(
-					secs4go.U4(String2UInt32(sv)),
-					secs4go.A(vid.name),
-					secs4go.A(vid.unit),
+		for _, id := range svList {
+			if sv, ok := SvMap[id]; ok {
+				entries = append(entries, secs4go.L(
+					secs4go.U4(String2UInt32(id)),
+					secs4go.A(sv.name),
+					secs4go.A(sv.unit),
 				))
 			} else {
-				replyVidVals = append(replyVidVals, secs4go.L(
-					secs4go.U4(String2UInt32(sv)),
+				entries = append(entries, secs4go.L( // 未知 SVID：ID 填充，名称/单位为空
+					secs4go.U4(String2UInt32(id)),
 					secs4go.A(""),
 					secs4go.A(""),
 				))
 			}
 		}
 	}
-
-	if len(replyVidVals) != 0 {
-		return secs4go.NewMessage(1, 4).WithItem(secs4go.L(replyVidVals...))
-	}
-
-	return secs4go.NewMessage(1, 12).WithItem(secs4go.L())
+	return secs4go.NewMessage(1, 12).WithItem(secs4go.L(entries...))
 }
 
-// Establish Communications Request (CR)
+// Establish Communications Request (CR)  →  S1F14
 func HandleS1F13(item *secs4go.Item) *secs4go.Message {
 	return secs4go.NewMessage(1, 14).WithItem(secs4go.L(
 		secs4go.B(0),
 		secs4go.L(
-			secs4go.A(SvMap["2007"].value.(string)),
-			secs4go.A(SvMap["2008"].value.(string)),
+			secs4go.A(svName("2007")),
+			secs4go.A(svName("2008")),
 		),
 	))
 }
 
-// Equipment Constant Request (ECR)
+// Equipment Constant Request (ECR)  →  S2F14
+// 注意：EC 来自 EvMap（设备常量），而非 SvMap（状态变量）
 func HandleS2F13(item *secs4go.Item) *secs4go.Message {
-	// 解析S2F13数据
-	var evList []string
-	if item.IsList() {
-		for i := 0; i < item.GetLength(); i++ {
-			child := item.GetItem(i)
-			switch child.Type {
-			case secs4go.TypeUInt16:
-				evList = append(evList, fmt.Sprint(child.Value.([]uint16)[0]))
-			case secs4go.TypeUInt32:
-				evList = append(evList, fmt.Sprint(child.Value.([]uint32)[0]))
-			default:
-				evList = append(evList, fmt.Sprint(child.Value.([]int16)[0]))
-			}
-		}
-	}
+	ecList := parseUintIDs(item)
 
-	// 构建S2F14返回数据
-	var replyVidVals []*secs4go.Item
-	if len(evList) == 0 {
-		for _, vid := range SvMap {
-			replyVidVals = append(replyVidVals, secs4go.A(vid.ValueToString()))
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
+
+	var vals []*secs4go.Item
+	if len(ecList) == 0 {
+		for _, ec := range EvMap {
+			vals = append(vals, secs4go.A(fmt.Sprint(ec.value)))
 		}
 	} else {
-		for _, sv := range evList {
-			if vid, ok := SvMap[sv]; ok {
-				replyVidVals = append(replyVidVals, secs4go.A(vid.ValueToString()))
+		for _, id := range ecList {
+			if ec, ok := EvMap[id]; ok {
+				vals = append(vals, secs4go.A(fmt.Sprint(ec.value)))
 			} else {
-				replyVidVals = append(replyVidVals, secs4go.L())
+				vals = append(vals, secs4go.L())
 			}
 		}
 	}
-
-	if len(replyVidVals) != 0 {
-		return secs4go.NewMessage(2, 14).WithItem(secs4go.L(replyVidVals...))
-	}
-
-	return secs4go.NewMessage(2, 14).WithItem(secs4go.L())
+	return secs4go.NewMessage(2, 14).WithItem(secs4go.L(vals...))
 }
 
-// Equipment Constant Namelist Request (ECNR)
+// Equipment Constant Namelist Request (ECNR)  →  S2F30
 func HandleS2F29(item *secs4go.Item) *secs4go.Message {
-	// 解析S2F29数据
-	var evList []string
-	if item.IsList() {
-		for i := 0; i < item.GetLength(); i++ {
-			child := item.GetItem(i)
-			switch child.Type {
-			case secs4go.TypeUInt16:
-				evList = append(evList, fmt.Sprint(child.Value.([]uint16)[0]))
-			case secs4go.TypeUInt32:
-				evList = append(evList, fmt.Sprint(child.Value.([]uint32)[0]))
-			default:
-				evList = append(evList, fmt.Sprint(child.Value.([]int16)[0]))
-			}
-		}
+	ecList := parseUintIDs(item)
+
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
+
+	ecEntry := func(id string, ec ECID) *secs4go.Item {
+		return secs4go.L(
+			secs4go.U4(String2UInt32(id)),
+			secs4go.A(ec.name),
+			secs4go.F4(ec.min.(float32)),
+			secs4go.F4(ec.max.(float32)),
+			secs4go.F4(ec.def.(float32)),
+			secs4go.A(ec.unit),
+		)
+	}
+	ecEmpty := func(id string) *secs4go.Item {
+		return secs4go.L(secs4go.U4(String2UInt32(id)),
+			secs4go.A(""), secs4go.A(""), secs4go.A(""), secs4go.A(""), secs4go.A(""))
 	}
 
-	// 构建S1F12返回数据
-	var replyVidVals []*secs4go.Item
-	if len(evList) == 0 {
-		for key, vid := range EvMap {
-			replyVidVals = append(replyVidVals, secs4go.L(
-				secs4go.U4(String2UInt32(key)),
-				secs4go.A(vid.name),
-				secs4go.F4(vid.min.(float32)),
-				secs4go.F4(vid.max.(float32)),
-				secs4go.F4(vid.def.(float32)),
-				secs4go.A(vid.unit),
-			))
+	var entries []*secs4go.Item
+	if len(ecList) == 0 {
+		for key, ec := range EvMap {
+			entries = append(entries, ecEntry(key, ec))
 		}
 	} else {
-		for _, sv := range evList {
-			if vid, ok := EvMap[sv]; ok {
-				replyVidVals = append(replyVidVals, secs4go.L(
-					secs4go.U4(String2UInt32(sv)),
-					secs4go.A(vid.name),
-					secs4go.F4(vid.min.(float32)),
-					secs4go.F4(vid.max.(float32)),
-					secs4go.F4(vid.def.(float32)),
-					secs4go.A(vid.unit),
-				))
+		for _, id := range ecList {
+			if ec, ok := EvMap[id]; ok {
+				entries = append(entries, ecEntry(id, ec))
 			} else {
-				replyVidVals = append(replyVidVals, secs4go.L(
-					secs4go.U4(String2UInt32(sv)),
-					secs4go.A(""),
-					secs4go.A(""),
-					secs4go.A(""),
-					secs4go.A(""),
-					secs4go.A(""),
-				))
+				entries = append(entries, ecEmpty(id))
 			}
 		}
 	}
-
-	if len(replyVidVals) != 0 {
-		return secs4go.NewMessage(2, 30).WithItem(secs4go.L(replyVidVals...))
-	}
-
-	return secs4go.NewMessage(2, 30).WithItem(secs4go.L())
+	return secs4go.NewMessage(2, 30).WithItem(secs4go.L(entries...))
 }
 
-// Define Report (DR)
+// Define Report (DR)  →  S2F34
 func HandleS2F33(item *secs4go.Item) (*secs4go.Message, error) {
-
-	var reportListMap = map[string]ReportLink{}
-
-	if item.IsList() {
-		dataItem := item.GetItem(1)
-		for i := 0; i < dataItem.GetLength(); i++ {
-			child := dataItem.GetItem(i)
-			if child.IsList() && child.GetLength() == 2 {
-				reportID := fmt.Sprint(child.GetItem(0).Value.([]uint16)[0])
-
-				if IsReportDefined(reportID) {
-					return DACKMessage(DACK3), fmt.Errorf("report %s already defined", reportID)
-				}
-
-				vidItem := child.GetItem(1)
-
-				vids := []string{}
-				for j := 0; j < vidItem.GetLength(); j++ {
-					vid := fmt.Sprint(vidItem.GetItem(j).Value.([]uint16)[0])
-					if !IsVidDefined(vid) {
-						return DACKMessage(DACK4), fmt.Errorf("vid %s not defined", vid)
-					}
-					vids = append(vids, vid)
-				}
-				reportListMap[reportID] = ReportLink{vids}
-			} else {
-				return DACKMessage(DACK1), fmt.Errorf("report format error")
-			}
-		}
-		//  if empty clear all
-		if len(reportListMap) == 0 {
-			ReportLinks = map[string]ReportLink{}
-		} else {
-			for reportID, reportLink := range reportListMap {
-				ReportLinks[reportID] = reportLink
-			}
-		}
-		return DACKMessage(DACK0), nil
+	if !item.IsList() {
+		return DACKMessage(DACK2), fmt.Errorf("S2F33: 报文不是 List 格式")
 	}
-	return DACKMessage(DACK2), fmt.Errorf("report format error")
+
+	dataItem := item.GetItem(1)
+	pending := map[string]ReportLink{}
+
+	for i := 0; i < dataItem.GetLength(); i++ {
+		child := dataItem.GetItem(i)
+		if !child.IsList() || child.GetLength() != 2 {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: 第 %d 个报告格式错误", i)
+		}
+		reportID := parseFirstUint(child.GetItem(0))
+		if IsReportDefined(reportID) {
+			return DACKMessage(DACK3), fmt.Errorf("S2F33: 报告 %s 已存在", reportID)
+		}
+		vids := parseUintIDs(child.GetItem(1))
+		for _, vid := range vids {
+			if !IsVidDefined(vid) {
+				return DACKMessage(DACK4), fmt.Errorf("S2F33: VID %s 未定义", vid)
+			}
+		}
+		pending[reportID] = ReportLink{vids}
+	}
+
+	deviceMu.Lock()
+	if len(pending) == 0 {
+		ReportLinks = map[string]ReportLink{} // 空列表 = 清除所有报告
+	} else {
+		for id, link := range pending {
+			ReportLinks[id] = link
+		}
+	}
+	deviceMu.Unlock()
+	return DACKMessage(DACK0), nil
 }
 
-// Link Event Report (LER)
+// Link Event Report (LER)  →  S2F36
 func HandleS2F35(item *secs4go.Item) (*secs4go.Message, error) {
-	var eventListMap = map[string]EventLink{}
-
-	if item.IsList() {
-		dataItem := item.GetItem(1)
-		for i := 0; i < dataItem.GetLength(); i++ {
-			child := dataItem.GetItem(i)
-			if child.IsList() && child.GetLength() == 2 {
-				eventID := fmt.Sprint(child.GetItem(0).Value.([]uint16)[0])
-
-				if IsEventDefined(eventID) {
-					return LRACKMessage(DACK3), fmt.Errorf("event %s already defined", eventID)
-				}
-
-				vidItem := child.GetItem(1)
-
-				reportIDs := []string{}
-				for j := 0; j < vidItem.GetLength(); j++ {
-					reportID := fmt.Sprint(vidItem.GetItem(j).Value.([]uint16)[0])
-					if !IsReportDefined(reportID) {
-						return LRACKMessage(DACK4), fmt.Errorf("report %s not defined", reportID)
-					}
-					reportIDs = append(reportIDs, reportID)
-				}
-				eventListMap[eventID] = EventLink{false, reportIDs}
-			} else {
-				return LRACKMessage(DACK1), fmt.Errorf("event format error")
-			}
-		}
-		//  if empty clear all
-		if len(eventListMap) == 0 {
-			EventLinks = map[string]EventLink{}
-		} else {
-			for eventID, eventLink := range eventListMap {
-				EventLinks[eventID] = eventLink
-			}
-		}
-		return LRACKMessage(DACK0), nil
+	if !item.IsList() {
+		return LRACKMessage(LRACK2), fmt.Errorf("S2F35: 报文不是 List 格式")
 	}
-	return LRACKMessage(DACK2), fmt.Errorf("event format error")
+
+	dataItem := item.GetItem(1)
+	pending := map[string]EventLink{}
+
+	for i := 0; i < dataItem.GetLength(); i++ {
+		child := dataItem.GetItem(i)
+		if !child.IsList() || child.GetLength() != 2 {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: 第 %d 个事件格式错误", i)
+		}
+		eventID := parseFirstUint(child.GetItem(0))
+		if IsEventDefined(eventID) {
+			return LRACKMessage(LRACK3), fmt.Errorf("S2F35: 事件 %s 已存在", eventID)
+		}
+		reportIDs := parseUintIDs(child.GetItem(1))
+		for _, rid := range reportIDs {
+			if !IsReportDefined(rid) {
+				return LRACKMessage(LRACK4), fmt.Errorf("S2F35: 报告 %s 未定义", rid)
+			}
+		}
+		pending[eventID] = EventLink{enable: false, links: reportIDs}
+	}
+
+	deviceMu.Lock()
+	if len(pending) == 0 {
+		EventLinks = map[string]EventLink{} // 空列表 = 清除所有事件关联
+	} else {
+		for id, link := range pending {
+			EventLinks[id] = link
+		}
+	}
+	deviceMu.Unlock()
+	return LRACKMessage(LRACK0), nil
 }
 
+// Enable/Disable Collection Event Report  →  S2F38
 func HandleS2F37(item *secs4go.Item) (*secs4go.Message, error) {
-
-	ceidList := []string{}
-
-	if item.IsList() {
-		enable := item.GetItem(0).Value.([]bool)[0]
-		dataItem := item.GetItem(1)
-		for i := 0; i < dataItem.GetLength(); i++ {
-			child := dataItem.GetItem(i)
-			ceid := fmt.Sprint(child.Value.([]uint16)[0])
-			if !IsEventDefined(ceid) {
-				return ERACKMessage(ERACK1), fmt.Errorf("event %s not defined", ceid)
-			}
-			ceidList = append(ceidList, ceid)
-		}
-
-		for _, ceid := range ceidList {
-			targetEvent := EventLinks[ceid]
-			targetEvent.enable = enable
-			EventLinks[ceid] = targetEvent
-		}
-		return LRACKMessage(ERACK0), nil
+	if !item.IsList() || item.GetLength() < 2 {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: 报文格式错误")
 	}
-	return ERACKMessage(ERACK2), fmt.Errorf("invalid format")
+
+	enableItem := item.GetItem(0)
+	if enableItem == nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: 缺少 enable 字段")
+	}
+	boolVals, ok := enableItem.Value.([]bool)
+	if !ok || len(boolVals) == 0 {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: enable 字段类型错误")
+	}
+	enable := boolVals[0]
+
+	ceids := parseUintIDs(item.GetItem(1))
+	for _, ceid := range ceids {
+		if !IsEventDefined(ceid) {
+			return ERACKMessage(ERACK1), fmt.Errorf("S2F37: 事件 %s 未定义", ceid)
+		}
+	}
+
+	deviceMu.Lock()
+	for _, ceid := range ceids {
+		ev := EventLinks[ceid]
+		ev.enable = enable
+		EventLinks[ceid] = ev
+	}
+	deviceMu.Unlock()
+	return ERACKMessage(ERACK0), nil
 }
 
-// 检查vid是否定义
+// IsVidDefined 检查 VID 是否在任意变量表中定义（使用读锁）
 func IsVidDefined(vid string) bool {
-	_, ok := SvMap[vid]
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
+	_, ok1 := SvMap[vid]
 	_, ok2 := DvMap[vid]
 	_, ok3 := EvMap[vid]
-	return ok || ok2 || ok3
+	return ok1 || ok2 || ok3
 }
 
-// 检查report是否定义
+// IsReportDefined 检查报告 ID 是否已定义（使用读锁）
 func IsReportDefined(reportID string) bool {
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 	_, ok := ReportLinks[reportID]
 	return ok
 }
 
-// 检查event是否定义
+// IsEventDefined 检查事件 ID 是否已定义（使用读锁）
 func IsEventDefined(eventID string) bool {
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 	_, ok := EventLinks[eventID]
 	return ok
 }
 
-// 检查event是否有效
+// IsEventValid 检查事件是否已定义且处于 enabled 状态（使用读锁）
 func IsEventValid(eventID string) bool {
-	_, ok := EventLinks[eventID]
-	return ok && EventLinks[eventID].enable
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
+	ev, ok := EventLinks[eventID]
+	return ok && ev.enable
 }
 
-func Trigger10020() (*secs4go.Message, error) {
-
-	if !IsEventValid("10020") {
-		return nil, fmt.Errorf("event 10020 not enabled")
+// TriggerEvent 触发指定 CEID 的 S6F11 Collection Event Report
+// 若事件未定义或未 enable，返回 error
+func TriggerEvent(ceid string) (*secs4go.Message, error) {
+	if !IsEventValid(ceid) {
+		return nil, fmt.Errorf("事件 %s 未定义或未启用", ceid)
 	}
-
-	return buildEvent("10020")
+	return buildEvent(ceid)
 }
 
-func Trigger10021() (*secs4go.Message, error) {
-
-	return nil, nil
-}
-
-func Trigger10050() (*secs4go.Message, error) {
-
-	return nil, nil
-}
-
+// buildEvent 构建 S6F11 消息（调用前须保证事件已 enabled）
 func buildEvent(ceid string) (*secs4go.Message, error) {
-
+	deviceMu.RLock()
 	eventLink, ok := EventLinks[ceid]
 	if !ok {
-		return nil, fmt.Errorf("event %s not defined", ceid)
+		deviceMu.RUnlock()
+		return nil, fmt.Errorf("事件 %s 未定义", ceid)
 	}
+	// 快照 report ID 列表，减少持锁时间
+	reportIDs := append([]string(nil), eventLink.links...)
+	deviceMu.RUnlock()
 
-	reportList := []*secs4go.Item{}
-	for _, reportID := range eventLink.links {
-		reportLink, ok := ReportLinks[reportID]
-		if !ok {
-			// return nil, fmt.Errorf("report %s not defined", reportID)
-			continue
+	var reportList []*secs4go.Item
+	for _, reportID := range reportIDs {
+		deviceMu.RLock()
+		reportLink, exists := ReportLinks[reportID]
+		deviceMu.RUnlock()
+		if !exists {
+			continue // 报告未定义时跳过，不中断整个事件
 		}
-
-		report, _ := buildReport(reportID, reportLink)
-		reportList = append(reportList, report)
+		reportList = append(reportList, buildReport(reportID, reportLink))
 	}
 
-	s6f11 := secs4go.NewMessage(6, 11).WithWBit(true).WithItem(secs4go.L(
+	return secs4go.NewMessage(6, 11).WithWBit(true).WithItem(secs4go.L(
 		secs4go.U2(0),
 		secs4go.U4(String2UInt32(ceid)),
 		secs4go.L(reportList...),
-	))
-
-	return s6f11, nil
+	)), nil
 }
 
-func buildReport(reportID string, reportLink ReportLink) (*secs4go.Item, error) {
+// buildReport 构建单条报告 Item（调用前须自行管理锁）
+func buildReport(reportID string, reportLink ReportLink) *secs4go.Item {
+	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 
-	vids := []*secs4go.Item{}
-
+	vals := make([]*secs4go.Item, 0, len(reportLink.links))
 	for _, vid := range reportLink.links {
-		dv, ok := DvMap[vid]
-		if !ok {
-			vids = append(vids, secs4go.A(""))
+		if dv, ok := DvMap[vid]; ok {
+			vals = append(vals, secs4go.A(fmt.Sprint(dv.value))) // 安全：fmt.Sprint 处理任意类型
 		} else {
-			vids = append(vids, secs4go.A(dv.value.(string)))
+			vals = append(vals, secs4go.A(""))
 		}
 	}
-
-	report := secs4go.L(
+	return secs4go.L(
 		secs4go.U4(String2UInt32(reportID)),
-		secs4go.L(vids...),
+		secs4go.L(vals...),
 	)
-
-	return report, nil
 }
 
+// UpdateDv 更新数据变量值（使用写锁）
 func UpdateDv(vid string, value interface{}) error {
+	deviceMu.Lock()
+	defer deviceMu.Unlock()
 	dv, ok := DvMap[vid]
 	if !ok {
-		return fmt.Errorf("vid %s not defined", vid)
+		return fmt.Errorf("DV %s 未定义", vid)
 	}
 	dv.value = value
 	DvMap[vid] = dv

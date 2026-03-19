@@ -11,13 +11,15 @@ import (
 
 // Message SECS消息
 type Message struct {
-	Stream      uint8          // 消息流 (1-127)
-	Function    uint8          // 消息功能
-	WBit        bool           // 等待位(需要回复)
-	SystemBytes uint32         // 系统字节(消息跟踪)
-	Item        *Item          // 消息体
-	Timestamp   time.Time      // 时间戳
-	sender      *HSMSTransport // 发送方 transport (用于回复)
+	Header      HSMSHeader // HSMS头快照
+	Stream      uint8      // 消息流 (1-127)
+	Function    uint8      // 消息功能
+	WBit        bool       // 等待位(需要回复)
+	SystemBytes uint32     // 系统字节(消息跟踪)
+	Item        *Item      // 消息体
+	RawData     []byte     // 原始Item数据
+	RawFrame    []byte     // 原始完整帧数据(4B长度 + 10B头 + 数据)
+	Timestamp   time.Time  // 时间戳
 }
 
 // NewMessage 创建新消息
@@ -60,6 +62,33 @@ func FormatMessage(msg *Message) string {
 	return fmt.Sprintf("S%dF%d(W=%v, SysBytes=%d)", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes)
 }
 
+func cloneBytes(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned
+}
+
+func (m *Message) applyProtocolSnapshot(header HSMSHeader, itemData []byte, frameData []byte, timestamp time.Time) {
+	if m == nil {
+		return
+	}
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	m.Header = header
+	m.Stream = header.Stream()
+	m.WBit = header.WBit()
+	m.Function = header.Function()
+	m.SystemBytes = header.SystemBytes
+	m.RawData = cloneBytes(itemData)
+	m.RawFrame = cloneBytes(frameData)
+	m.Timestamp = timestamp
+}
+
 // ============================================================
 // Message <-> HSMSHeader 转换
 // ============================================================
@@ -84,15 +113,9 @@ func BuildHSMSHeader(deviceID uint16, msg *Message, sType SType, systemBytes uin
 
 // ParseMessage HSMSHeader + []byte → Message
 // 从HSMSHeader提取S/F/WBit，解析Item
-func ParseMessage(header HSMSHeader, data []byte, sender *HSMSTransport, codec *ItemCodec) (*Message, error) {
-	msg := &Message{
-		Stream:      header.Stream(),
-		WBit:        header.WBit(),
-		Function:    header.Function(),
-		SystemBytes: header.SystemBytes,
-		Timestamp:   time.Now(),
-		sender:      sender,
-	}
+func ParseMessage(header HSMSHeader, data []byte, codec *ItemCodec) (*Message, error) {
+	msg := &Message{}
+	msg.applyProtocolSnapshot(header, data, BuildCompleteFrame(header, data), time.Now())
 
 	// 解析Item数据
 	if len(data) > 0 {

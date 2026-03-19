@@ -14,8 +14,9 @@ import (
 var ErrTimeoutT3 = errors.New("T3 reply timeout")
 
 type replyResult struct {
-	data []byte
-	err  error
+	header HSMSHeader
+	data   []byte
+	err    error
 }
 
 // ============================================================
@@ -46,7 +47,7 @@ type SecsGem struct {
 // NewSecsGem 创建会话
 func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport, logger Logger, codec *ItemCodec) *SecsGem {
 	if logger == nil {
-		logger = NewFileLogger(deviceName)
+		logger = NewSilentLogger()
 	}
 	if codec == nil {
 		codec = DefaultItemCodec
@@ -103,6 +104,10 @@ func (s *SecsGem) cancelPendingReplies(err error) {
 // Send 发送消息并返回回复
 // 无需回复的消息返回 (nil, nil)
 func (s *SecsGem) Send(msg *Message) (*Message, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("message is nil")
+	}
+
 	// 编码 Item
 	var itemData []byte
 	if msg.Item != nil {
@@ -116,32 +121,33 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 构建 HSMSHeader
 	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, s.transport.NextSystemBytes())
 	frameData := BuildCompleteFrame(header, itemData)
+	msg.applyProtocolSnapshot(header, itemData, frameData, time.Now())
 
 	// 日志
 	s.logger.Info(">>> Send S%dF%d(W=%v, SysBytes=%d)\n%s\n%s",
 		msg.Stream, msg.Function, msg.WBit, header.SystemBytes,
-		FormatHexData(frameData), FormatSML(msg.Item))
+		FormatHexData(msg.RawFrame), FormatSML(msg.Item))
 
 	// 无需回复的消息
 	if !msg.WBit {
-		if err := s.transport.Send(frameData); err != nil {
+		if err := s.transport.Send(msg.RawFrame); err != nil {
 			return nil, fmt.Errorf("send failed: %w", err)
 		}
 		return nil, nil
 	}
 
 	// 需要回复的消息
-	replyData, err := s.sendAndWait(frameData, header)
+	reply, err := s.sendAndWait(msg.RawFrame, header)
 	if err != nil {
 		return nil, fmt.Errorf("send failed: %w", err)
 	}
 
 	// 解析回复
-	if len(replyData) == 0 {
+	if len(reply.data) == 0 {
 		return nil, nil
 	}
 
-	parsed, err := ParseMessage(header, replyData, s.transport, s.itemCodec)
+	parsed, err := ParseMessage(reply.header, reply.data, s.itemCodec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse reply: %v", err)
 	}
@@ -150,6 +156,13 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 
 // SendReply 发送回复消息（使用原消息的 SystemBytes）
 func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
+	if origMsg == nil {
+		return fmt.Errorf("original message is nil")
+	}
+	if reply == nil {
+		return fmt.Errorf("reply message is nil")
+	}
+
 	// 编码 Item
 	var itemData []byte
 	if reply.Item != nil {
@@ -163,22 +176,19 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	// 使用原消息的 SystemBytes
 	header := BuildDataHeader(s.config.DeviceID, reply.Stream, reply.Function, false, origMsg.SystemBytes)
 	frameData := BuildCompleteFrame(header, itemData)
+	reply.applyProtocolSnapshot(header, itemData, frameData, time.Now())
 
 	// 日志
 	s.logger.Info(">>> Send S%dF%d(W=false, SysBytes=%d)\n%s\n%s",
 		reply.Stream, reply.Function, header.SystemBytes,
-		FormatHexData(frameData), FormatSML(reply.Item))
+		FormatHexData(reply.RawFrame), FormatSML(reply.Item))
 
 	// 发送
-	transport := origMsg.sender
-	if transport == nil {
-		transport = s.transport
-	}
-	return transport.Send(frameData)
+	return s.transport.Send(reply.RawFrame)
 }
 
 // sendAndWait 发送并等待回复（独立收发机制）
-func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, error) {
+func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) (replyResult, error) {
 	systemBytes := header.SystemBytes
 
 	// 创建回复通道
@@ -193,7 +203,7 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 	// 发送
 	if err := s.transport.Send(frameData); err != nil {
 		s.logger.Error("[%v] send failed: %v", header.SystemBytes, err)
-		return nil, err
+		return replyResult{}, err
 	}
 
 	timer := time.NewTimer(s.config.T3)
@@ -203,25 +213,25 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) ([]byte, erro
 	select {
 	case res := <-replyChan:
 		if res.err != nil {
-			return nil, res.err
+			return replyResult{}, res.err
 		}
-		return res.data, nil
+		return res, nil
 	case <-s.done:
 		// 会话关闭：视为无回复
-		return nil, nil
+		return replyResult{}, nil
 	case <-s.transport.ConnDone():
 		// 连接断开：视为无回复
-		return nil, nil
+		return replyResult{}, nil
 	case <-timer.C:
 		s.logger.Error("Timeout waiting for reply (T3=%v) (SysBytes=%d)", s.config.T3, systemBytes)
-		return nil, ErrTimeoutT3
+		return replyResult{}, ErrTimeoutT3
 	}
 }
 
 // handleDataMessage 处理收到的数据消息（所有数据会话统一处理）
 func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 
-	msg, err := ParseMessage(header, itemData, s.transport, s.itemCodec)
+	msg, err := ParseMessage(header, itemData, s.itemCodec)
 	if err != nil {
 		s.logger.Error("Failed to parse message: %v", err)
 		return
@@ -229,9 +239,8 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 	// 记录接收日志
 	s.logReceivedData(msg)
 
-	// 如果是回复消息（WBit=false），查找等待的请求并发送回复数据
-	if !msg.WBit {
-		s.handleReply(msg.SystemBytes, itemData)
+	// 优先按 pending request 关联 reply；未命中时按普通上行消息处理。
+	if s.handleReply(header, itemData) {
 		return
 	}
 
@@ -247,29 +256,28 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 }
 
 // handleReply 处理收到的回复消息（由 handleDataMessage 调用）
-func (s *SecsGem) handleReply(systemBytes uint32, itemData []byte) {
-	if ch, ok := s.pendingReplies.Load(systemBytes); ok {
+func (s *SecsGem) handleReply(header HSMSHeader, itemData []byte) bool {
+	if ch, ok := s.pendingReplies.Load(header.SystemBytes); ok {
 		select {
-		case ch.(chan replyResult) <- replyResult{data: itemData}:
+		case ch.(chan replyResult) <- replyResult{header: header, data: itemData}:
 		default:
 		}
+		return true
 	}
+	return false
 }
 
 // logReceivedData 记录数据消息接收日志
 func (s *SecsGem) logReceivedData(msg *Message) {
-	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, msg.SystemBytes)
-	var itemData []byte
-	if msg.Item != nil {
-		var err error
-		itemData, err = s.itemCodec.EncodeItem(msg.Item)
-		if err != nil {
-			s.logger.Error("Failed to encode item for log: %v", err)
-			return
+	rawFrame := msg.RawFrame
+	if len(rawFrame) == 0 {
+		header := msg.Header
+		if header.SystemBytes == 0 && msg.SystemBytes != 0 {
+			header = BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, msg.SystemBytes)
 		}
+		rawFrame = BuildCompleteFrame(header, msg.RawData)
 	}
-	frameData := BuildCompleteFrame(header, itemData)
-	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(frameData), FormatSML(msg.Item))
+	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(rawFrame), FormatSML(msg.Item))
 }
 
 // sendDefaultReply 发送默认回复 (上层未处理时)

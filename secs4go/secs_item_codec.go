@@ -3,6 +3,7 @@ package secs4go
 import (
 	"encoding/binary"
 	"errors"
+	"log"
 	"math"
 	"strings"
 
@@ -35,8 +36,9 @@ type ItemCodec struct {
 // NewItemCodec 创建新的编解码器
 func NewItemCodec(encodingName string) (*ItemCodec, error) {
 	var enc encoding.Encoding
+	normalizedName := strings.ToUpper(strings.TrimSpace(encodingName))
 
-	switch strings.ToUpper(encodingName) {
+	switch normalizedName {
 	case "GBK":
 		enc = simplifiedchinese.GBK
 	case "GB2312":
@@ -46,6 +48,9 @@ func NewItemCodec(encodingName string) (*ItemCodec, error) {
 	case "ASCII":
 		enc = nil // ASCII 也是默认处理（直接转换）
 	default:
+		if normalizedName != "" {
+			log.Printf("[WARN] unknown ItemAEncoding %q, fallback to ASCII", encodingName)
+		}
 		// 默认为 ASCII/UTF-8 (不转换)
 		enc = nil
 	}

@@ -29,7 +29,3 @@ Thumbs.db
 
 # Local env
 .env
-
-CLAUDE.md
-.claude/
-.claude

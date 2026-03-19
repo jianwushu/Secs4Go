@@ -65,14 +65,21 @@ type HSMSTransport struct {
 
 // NewHSMSTransport 创建传输层
 func NewHSMSTransport(config *Config) *HSMSTransport {
+	var t6, t7 time.Duration
+	if config != nil {
+		t6 = config.T6
+		t7 = config.T7
+	}
+
 	// 初始为 disconnected：不预先塞一个“已关闭”的 connDone。
 	// 否则后续断连/Stop 时再次 close 会触发 panic: close of closed channel。
 	// 当 connDone == nil 时，ConnDone() 会返回一个临时的已关闭通道，供等待方立即退出。
 	return &HSMSTransport{
 		config:           config,
 		state:            StateDisconnected,
-		t6Timer:          time.NewTimer(config.T6),
-		t7Timer:          time.NewTimer(config.T7),
+		logger:           NewSilentLogger(),
+		t6Timer:          time.NewTimer(t6),
+		t7Timer:          time.NewTimer(t7),
 		controlReplyChan: make(chan struct{}, 1),
 		connDone:         nil,
 		stopChan:         make(chan struct{}),
@@ -87,6 +94,16 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 
 // Start 启动传输层 (根据 IsActive 自动选择客户端或服务端模式)
 func (t *HSMSTransport) Start() error {
+	if t == nil {
+		return fmt.Errorf("transport is nil")
+	}
+	if t.logger == nil {
+		t.logger = NewSilentLogger()
+	}
+	if err := t.config.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	// 新一轮生命周期初始化（支持 Stop() 后再次 Start()）
 	t.mu.Lock()
 	if t.state == StateDisconnected {
@@ -618,6 +635,22 @@ func (t *HSMSTransport) SendSeparateReq() error {
 	return t.SendControl(header)
 }
 
+// Reconnect 主动触发重连。
+//
+// 若当前已 Selected，先发送 Separate.req 通知服务端断开；
+// 随后立即关闭连接、重置状态，并触发自动重连流程（等 T5 后重新 Connect + Select）。
+//
+// 注意：
+//   - 仅在 AutoReconnect=true 时才会自动重新建立连接。
+//     若 AutoReconnect=false，可在 StateDisconnected 状态变更回调中手动调用 Start()。
+//   - 若传输层正在 Stop() 过程中，本方法为 no-op。
+func (t *HSMSTransport) Reconnect() {
+	if t.IsSelected() {
+		_ = t.SendSeparateReq()
+	}
+	t.handleDisconnect()
+}
+
 // ============================================================
 // 公共方法
 // ============================================================
@@ -743,12 +776,6 @@ func (t *HSMSTransport) receiveLoop() {
 
 // processDataMessage 处理数据消息 - 只做解析，路由到 secsgem 的回调
 func (t *HSMSTransport) processDataMessage(header HSMSHeader, itemData []byte) {
-	// 解析消息 (传入 self transport 用于回复)
-	// msg, err := ParseMessage(header, itemData, t, t.itemCodec)
-	// if err != nil {
-	// 	t.logger.Error("Failed to parse message: %v", err)
-	// 	return
-	// }
 
 	// 路由到数据消息回调（所有数据会话由 secsgem 统一处理）
 	t.mu.RLock()
@@ -857,9 +884,7 @@ func (t *HSMSTransport) sendLinkTestRsp(systemBytes uint32) {
 
 // sendSelectRsp 发送 Select.rsp
 func (t *HSMSTransport) sendSelectRsp(systemBytes uint32, status byte) {
-	t.logger.Debug("sendSelectRsp INPUT: systemBytes=%d", systemBytes)
 	header := BuildSelectRspHeader(systemBytes, status)
-	t.logger.Debug("sendSelectRsp after build: SType=%s SystemBytes=%d", header.SType, header.SystemBytes)
 	t.SendControl(header)
 }
 
@@ -962,13 +987,15 @@ func (t *HSMSTransport) OnStateChange(handler StateChangeHandler) {
 }
 
 // notifyStateChange 通知状态变更
+// 注意：handler 在独立 goroutine 中执行，避免在 receiveLoop 内同步调用阻塞型操作
+// （例如 stateHandler 中调用 client.Send(S1F13) 需要 receiveLoop 读取回复，若同步调用则死锁）
 func (t *HSMSTransport) notifyStateChange(oldState, newState ConnectionState) {
 	t.mu.RLock()
 	handler := t.stateHandler
 	t.mu.RUnlock()
 
 	if handler != nil {
-		handler(oldState, newState)
+		go handler(oldState, newState)
 	}
 }
 
