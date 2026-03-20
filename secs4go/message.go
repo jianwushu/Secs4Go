@@ -11,15 +11,13 @@ import (
 
 // Message SECS消息
 type Message struct {
-	Header      HSMSHeader // HSMS头快照
-	Stream      uint8      // 消息流 (1-127)
-	Function    uint8      // 消息功能
-	WBit        bool       // 等待位(需要回复)
-	SystemBytes uint32     // 系统字节(消息跟踪)
-	Item        *Item      // 消息体
-	RawData     []byte     // 原始Item数据
-	RawFrame    []byte     // 原始完整帧数据(4B长度 + 10B头 + 数据)
-	Timestamp   time.Time  // 时间戳
+	Stream      uint8     // 消息流 (1-127)
+	Function    uint8     // 消息功能
+	WBit        bool      // 等待位(需要回复)
+	SystemBytes uint32    // 系统字节(消息跟踪)
+	Item        *Item     // 消息体
+	RawFrame    []byte    // 原始完整帧数据(4B长度 + 10B头 + 数据)，发送/接收链路必须保证有值
+	Timestamp   time.Time // 时间戳
 }
 
 // NewMessage 创建新消息
@@ -79,12 +77,10 @@ func (m *Message) applyProtocolSnapshot(header HSMSHeader, itemData []byte, fram
 		timestamp = time.Now()
 	}
 
-	m.Header = header
 	m.Stream = header.Stream()
 	m.WBit = header.WBit()
 	m.Function = header.Function()
 	m.SystemBytes = header.SystemBytes
-	m.RawData = cloneBytes(itemData)
 	m.RawFrame = cloneBytes(frameData)
 	m.Timestamp = timestamp
 }

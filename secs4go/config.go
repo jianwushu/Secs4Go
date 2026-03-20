@@ -2,6 +2,7 @@ package secs4go
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -84,11 +85,33 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("T8 must be positive")
 	}
 
+	normalizedEncoding := normalizeItemAEncoding(c.ItemAEncoding)
+	if !isSupportedItemAEncoding(normalizedEncoding) {
+		return fmt.Errorf("unsupported ItemAEncoding %q", c.ItemAEncoding)
+	}
+
 	if c.EnableHeartbeat && c.HeartbeatInterval <= 0 {
 		return fmt.Errorf("heartbeat interval must be positive when heartbeat is enabled")
 	}
 
 	return nil
+}
+
+func normalizeItemAEncoding(name string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(name))
+	if normalized == "UTF8" {
+		return "UTF-8"
+	}
+	return normalized
+}
+
+func isSupportedItemAEncoding(name string) bool {
+	switch name {
+	case "ASCII", "GBK", "GB2312", "UTF-8":
+		return true
+	default:
+		return false
+	}
 }
 
 // Clone 克隆配置

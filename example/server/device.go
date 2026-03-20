@@ -150,6 +150,67 @@ func parseFirstUint(item *secs4go.Item) string {
 	return fmt.Sprint(item.Value)
 }
 
+func parseBoolFlag(item *secs4go.Item, fieldName string) (bool, error) {
+	if item == nil {
+		return false, fmt.Errorf("%s 缺失", fieldName)
+	}
+	boolVals, ok := item.Value.([]bool)
+	if !ok {
+		return false, fmt.Errorf("%s 类型错误: 期望 []bool, 实际 ItemType=%v ValueType=%T", fieldName, item.Type, item.Value)
+	}
+	if len(boolVals) == 0 {
+		return false, fmt.Errorf("%s 类型错误: []bool 为空", fieldName)
+	}
+	return boolVals[0], nil
+}
+
+func parseIDListFromListItem(item *secs4go.Item, fieldName string) ([]string, error) {
+	if err := requireListWithMinLength(item, 0, fieldName); err != nil {
+		return nil, err
+	}
+	return parseUintIDs(item), nil
+}
+
+func requireListWithMinLength(item *secs4go.Item, minLength int, name string) error {
+	if item == nil {
+		return fmt.Errorf("%s 缺失", name)
+	}
+	if !item.IsList() {
+		return fmt.Errorf("%s 不是 List 格式", name)
+	}
+	if item.GetLength() < minLength {
+		return fmt.Errorf("%s 长度不足: 期望至少 %d, 实际 %d", name, minLength, item.GetLength())
+	}
+	return nil
+}
+
+func requireListLength(item *secs4go.Item, expectedLength int, name string) error {
+	if err := requireListWithMinLength(item, expectedLength, name); err != nil {
+		return err
+	}
+	if item.GetLength() != expectedLength {
+		return fmt.Errorf("%s 长度错误: 期望 %d, 实际 %d", name, expectedLength, item.GetLength())
+	}
+	return nil
+}
+
+func getRequiredListItem(parent *secs4go.Item, index int, parentName string) (*secs4go.Item, error) {
+	if parent == nil {
+		return nil, fmt.Errorf("%s 缺失", parentName)
+	}
+	if !parent.IsList() {
+		return nil, fmt.Errorf("%s 不是 List 格式", parentName)
+	}
+	if index < 0 || index >= parent.GetLength() {
+		return nil, fmt.Errorf("%s 缺少索引 %d: 实际长度 %d", parentName, index, parent.GetLength())
+	}
+	item := parent.GetItem(index)
+	if item == nil {
+		return nil, fmt.Errorf("%s[%d] 为空", parentName, index)
+	}
+	return item, nil
+}
+
 // svName 安全获取 SvMap 中的字符串字段（避免直接类型断言 panic）
 func svName(key string) string {
 	deviceMu.RLock()
@@ -309,23 +370,45 @@ func HandleS2F29(item *secs4go.Item) *secs4go.Message {
 
 // Define Report (DR)  →  S2F34
 func HandleS2F33(item *secs4go.Item) (*secs4go.Message, error) {
-	if !item.IsList() {
-		return DACKMessage(DACK2), fmt.Errorf("S2F33: 报文不是 List 格式")
+	if err := requireListWithMinLength(item, 2, "S2F33 报文"); err != nil {
+		return DACKMessage(DACK2), fmt.Errorf("S2F33: %w", err)
 	}
 
-	dataItem := item.GetItem(1)
+	dataItem, err := getRequiredListItem(item, 1, "S2F33 报文")
+	if err != nil {
+		return DACKMessage(DACK2), fmt.Errorf("S2F33: %w", err)
+	}
+	if err := requireListWithMinLength(dataItem, 0, "S2F33 报文[1] 报告列表"); err != nil {
+		return DACKMessage(DACK2), fmt.Errorf("S2F33: %w", err)
+	}
+
 	pending := map[string]ReportLink{}
 
 	for i := 0; i < dataItem.GetLength(); i++ {
-		child := dataItem.GetItem(i)
-		if !child.IsList() || child.GetLength() != 2 {
-			return DACKMessage(DACK1), fmt.Errorf("S2F33: 第 %d 个报告格式错误", i)
+		child, err := getRequiredListItem(dataItem, i, "S2F33 报文[1] 报告列表")
+		if err != nil {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: %w", err)
 		}
-		reportID := parseFirstUint(child.GetItem(0))
+		if err := requireListLength(child, 2, fmt.Sprintf("S2F33 报文[1][%d] 报告项", i)); err != nil {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: %w", err)
+		}
+		reportIDItem, err := getRequiredListItem(child, 0, fmt.Sprintf("S2F33 报文[1][%d] 报告项", i))
+		if err != nil {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: %w", err)
+		}
+		reportIDsItem, err := getRequiredListItem(child, 1, fmt.Sprintf("S2F33 报文[1][%d] 报告项", i))
+		if err != nil {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: %w", err)
+		}
+
+		reportID := parseFirstUint(reportIDItem)
 		if IsReportDefined(reportID) {
 			return DACKMessage(DACK3), fmt.Errorf("S2F33: 报告 %s 已存在", reportID)
 		}
-		vids := parseUintIDs(child.GetItem(1))
+		vids, err := parseIDListFromListItem(reportIDsItem, fmt.Sprintf("S2F33 报文[1][%d] 报告项[1] VID 列表", i))
+		if err != nil {
+			return DACKMessage(DACK1), fmt.Errorf("S2F33: %w", err)
+		}
 		for _, vid := range vids {
 			if !IsVidDefined(vid) {
 				return DACKMessage(DACK4), fmt.Errorf("S2F33: VID %s 未定义", vid)
@@ -348,23 +431,45 @@ func HandleS2F33(item *secs4go.Item) (*secs4go.Message, error) {
 
 // Link Event Report (LER)  →  S2F36
 func HandleS2F35(item *secs4go.Item) (*secs4go.Message, error) {
-	if !item.IsList() {
-		return LRACKMessage(LRACK2), fmt.Errorf("S2F35: 报文不是 List 格式")
+	if err := requireListWithMinLength(item, 2, "S2F35 报文"); err != nil {
+		return LRACKMessage(LRACK2), fmt.Errorf("S2F35: %w", err)
 	}
 
-	dataItem := item.GetItem(1)
+	dataItem, err := getRequiredListItem(item, 1, "S2F35 报文")
+	if err != nil {
+		return LRACKMessage(LRACK2), fmt.Errorf("S2F35: %w", err)
+	}
+	if err := requireListWithMinLength(dataItem, 0, "S2F35 报文[1] 事件列表"); err != nil {
+		return LRACKMessage(LRACK2), fmt.Errorf("S2F35: %w", err)
+	}
+
 	pending := map[string]EventLink{}
 
 	for i := 0; i < dataItem.GetLength(); i++ {
-		child := dataItem.GetItem(i)
-		if !child.IsList() || child.GetLength() != 2 {
-			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: 第 %d 个事件格式错误", i)
+		child, err := getRequiredListItem(dataItem, i, "S2F35 报文[1] 事件列表")
+		if err != nil {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: %w", err)
 		}
-		eventID := parseFirstUint(child.GetItem(0))
+		if err := requireListLength(child, 2, fmt.Sprintf("S2F35 报文[1][%d] 事件项", i)); err != nil {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: %w", err)
+		}
+		eventIDItem, err := getRequiredListItem(child, 0, fmt.Sprintf("S2F35 报文[1][%d] 事件项", i))
+		if err != nil {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: %w", err)
+		}
+		reportIDsItem, err := getRequiredListItem(child, 1, fmt.Sprintf("S2F35 报文[1][%d] 事件项", i))
+		if err != nil {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: %w", err)
+		}
+
+		eventID := parseFirstUint(eventIDItem)
 		if IsEventDefined(eventID) {
 			return LRACKMessage(LRACK3), fmt.Errorf("S2F35: 事件 %s 已存在", eventID)
 		}
-		reportIDs := parseUintIDs(child.GetItem(1))
+		reportIDs, err := parseIDListFromListItem(reportIDsItem, fmt.Sprintf("S2F35 报文[1][%d] 事件项[1] 报告列表", i))
+		if err != nil {
+			return LRACKMessage(LRACK1), fmt.Errorf("S2F35: %w", err)
+		}
 		for _, rid := range reportIDs {
 			if !IsReportDefined(rid) {
 				return LRACKMessage(LRACK4), fmt.Errorf("S2F35: 报告 %s 未定义", rid)
@@ -387,21 +492,27 @@ func HandleS2F35(item *secs4go.Item) (*secs4go.Message, error) {
 
 // Enable/Disable Collection Event Report  →  S2F38
 func HandleS2F37(item *secs4go.Item) (*secs4go.Message, error) {
-	if !item.IsList() || item.GetLength() < 2 {
-		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: 报文格式错误")
+	if err := requireListWithMinLength(item, 2, "S2F37 报文"); err != nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: %w", err)
 	}
 
-	enableItem := item.GetItem(0)
-	if enableItem == nil {
-		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: 缺少 enable 字段")
+	enableItem, err := getRequiredListItem(item, 0, "S2F37 报文")
+	if err != nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: %w", err)
 	}
-	boolVals, ok := enableItem.Value.([]bool)
-	if !ok || len(boolVals) == 0 {
-		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: enable 字段类型错误")
+	enable, err := parseBoolFlag(enableItem, "S2F37 enable 字段")
+	if err != nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: %w", err)
 	}
-	enable := boolVals[0]
 
-	ceids := parseUintIDs(item.GetItem(1))
+	ceidsItem, err := getRequiredListItem(item, 1, "S2F37 报文")
+	if err != nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: %w", err)
+	}
+	ceids, err := parseIDListFromListItem(ceidsItem, "S2F37 CEID 列表")
+	if err != nil {
+		return ERACKMessage(ERACK2), fmt.Errorf("S2F37: %w", err)
+	}
 	for _, ceid := range ceids {
 		if !IsEventDefined(ceid) {
 			return ERACKMessage(ERACK1), fmt.Errorf("S2F37: 事件 %s 未定义", ceid)
@@ -520,5 +631,18 @@ func UpdateDv(vid string, value interface{}) error {
 	}
 	dv.value = value
 	DvMap[vid] = dv
+	return nil
+}
+
+// UpdateSv 更新状态变量值（使用写锁）
+func UpdateSv(vid string, value interface{}) error {
+	deviceMu.Lock()
+	defer deviceMu.Unlock()
+	sv, ok := SvMap[vid]
+	if !ok {
+		return fmt.Errorf("SV %s 未定义", vid)
+	}
+	sv.value = value
+	SvMap[vid] = sv
 	return nil
 }

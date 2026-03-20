@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
+	"github.com/jianwushu/Secs4go/example/sharedcfg"
 	"github.com/jianwushu/Secs4go/secs4go"
 )
 
@@ -26,6 +26,7 @@ type serverOptions struct {
 	EventInterval        time.Duration
 	EventInitialDelay    time.Duration
 	SelectedPollInterval time.Duration
+	EnablePublisher      bool
 	ItemAEncoding        string
 	LogLevel             string
 }
@@ -38,6 +39,7 @@ func defaultServerOptions() serverOptions {
 		EventInterval:        defaultEventInterval,
 		EventInitialDelay:    defaultEventInitialDelay,
 		SelectedPollInterval: defaultSelectedPoll,
+		EnablePublisher:      true,
 		ItemAEncoding:        defaultServerItemAEncoding,
 		LogLevel:             "info",
 	}
@@ -48,7 +50,10 @@ func parseServerOptions(args []string) (serverOptions, error) {
 	fs.SetOutput(io.Discard)
 
 	opts := defaultServerOptions()
-	var deviceID uint
+	var (
+		deviceID uint
+		err      error
+	)
 
 	fs.StringVar(&opts.Address, "addr", opts.Address, "listen address")
 	fs.UintVar(&deviceID, "device-id", uint(opts.DeviceID), "server device id")
@@ -56,6 +61,7 @@ func parseServerOptions(args []string) (serverOptions, error) {
 	fs.DurationVar(&opts.EventInterval, "event-interval", opts.EventInterval, "interval between demo events")
 	fs.DurationVar(&opts.EventInitialDelay, "event-initial-delay", opts.EventInitialDelay, "delay before first demo event after selection")
 	fs.DurationVar(&opts.SelectedPollInterval, "selected-poll-interval", opts.SelectedPollInterval, "poll interval while waiting for selected state")
+	fs.BoolVar(&opts.EnablePublisher, "enable-publisher", opts.EnablePublisher, "enable demo event publisher")
 	fs.StringVar(&opts.ItemAEncoding, "item-a-encoding", opts.ItemAEncoding, "Item A encoding")
 	fs.StringVar(&opts.LogLevel, "log-level", opts.LogLevel, "log level (debug/info/warn/error)")
 
@@ -67,14 +73,11 @@ func parseServerOptions(args []string) (serverOptions, error) {
 		return serverOptions{}, fmt.Errorf("device-id must be <= %d", uint(^uint16(0)))
 	}
 	opts.DeviceID = uint16(deviceID)
-	opts.Address = strings.TrimSpace(opts.Address)
-	opts.ItemAEncoding = strings.TrimSpace(opts.ItemAEncoding)
-	if opts.ItemAEncoding == "" {
-		opts.ItemAEncoding = defaultServerItemAEncoding
+	opts.Address, err = sharedcfg.NormalizeAddress(opts.Address)
+	if err != nil {
+		return serverOptions{}, err
 	}
-	if opts.Address == "" {
-		return serverOptions{}, fmt.Errorf("addr is required")
-	}
+	opts.ItemAEncoding = sharedcfg.NormalizeItemAEncoding(opts.ItemAEncoding, defaultServerItemAEncoding)
 	if opts.T3 <= 0 {
 		return serverOptions{}, fmt.Errorf("t3 must be positive")
 	}
@@ -87,11 +90,9 @@ func parseServerOptions(args []string) (serverOptions, error) {
 	if opts.SelectedPollInterval <= 0 {
 		return serverOptions{}, fmt.Errorf("selected-poll-interval must be positive")
 	}
-	switch strings.ToLower(opts.LogLevel) {
-	case "debug", "info", "warn", "error":
-		opts.LogLevel = strings.ToLower(opts.LogLevel)
-	default:
-		return serverOptions{}, fmt.Errorf("log-level must be one of: debug, info, warn, error")
+	opts.LogLevel, err = sharedcfg.NormalizeLogLevel(opts.LogLevel)
+	if err != nil {
+		return serverOptions{}, err
 	}
 
 	return opts, nil

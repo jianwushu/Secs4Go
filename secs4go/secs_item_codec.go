@@ -3,9 +3,8 @@ package secs4go
 import (
 	"encoding/binary"
 	"errors"
-	"log"
+	"fmt"
 	"math"
-	"strings"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -36,23 +35,17 @@ type ItemCodec struct {
 // NewItemCodec 创建新的编解码器
 func NewItemCodec(encodingName string) (*ItemCodec, error) {
 	var enc encoding.Encoding
-	normalizedName := strings.ToUpper(strings.TrimSpace(encodingName))
+	normalizedName := normalizeItemAEncoding(encodingName)
 
 	switch normalizedName {
 	case "GBK":
 		enc = simplifiedchinese.GBK
 	case "GB2312":
 		enc = simplifiedchinese.GB18030 // GB18030 兼容 GB2312
-	case "UTF-8", "UTF8":
-		enc = nil // UTF-8 是默认值，不需要转换
-	case "ASCII":
-		enc = nil // ASCII 也是默认处理（直接转换）
+	case "UTF-8", "ASCII":
+		enc = nil // UTF-8/ASCII 直接使用原始字节
 	default:
-		if normalizedName != "" {
-			log.Printf("[WARN] unknown ItemAEncoding %q, fallback to ASCII", encodingName)
-		}
-		// 默认为 ASCII/UTF-8 (不转换)
-		enc = nil
+		return nil, fmt.Errorf("unsupported ItemAEncoding %q", encodingName)
 	}
 
 	codec := &ItemCodec{}
@@ -335,12 +328,12 @@ func (c *ItemCodec) encodeString(value interface{}) ([]byte, error) {
 
 func (c *ItemCodec) decodeString(data []byte) (interface{}, error) {
 	if c.decoder == nil {
-		return data, nil // 保持原始字节，由上层转换为string
+		return data, nil
 	}
 
 	decoded, _, err := transform.Bytes(c.decoder, data)
 	if err != nil {
-		return data, nil // 解码失败返回原始数据
+		return nil, fmt.Errorf("decode string failed: %w", err)
 	}
 	return decoded, nil
 }

@@ -23,12 +23,12 @@ type eventPublisher struct {
 
 func newEventPublisher(opts serverOptions, server *secs4go.SecsGem) *eventPublisher {
 	return &eventPublisher{
-		interval:             opts.EventInterval,
-		initialDelay:         opts.EventInitialDelay,
-		selectedPollInterval: opts.SelectedPollInterval,
-		counter:              10,
-		isSelected:           server.IsSelected,
-		updateDV:             UpdateDv,
+		interval:     opts.EventInterval,
+		initialDelay: opts.EventInitialDelay,
+		// selectedPollInterval: opts.SelectedPollInterval,
+		counter:    10,
+		isSelected: server.IsSelected,
+		updateDV:   UpdateDv,
 		trigger: func() (*secs4go.Message, error) {
 			return TriggerEvent("10020")
 		},

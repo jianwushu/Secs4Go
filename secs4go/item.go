@@ -233,3 +233,117 @@ func (i *Item) Append(child *Item) *Item {
 
 	return i
 }
+
+// AsList 读取List子项
+func (i *Item) AsList() ([]*Item, bool) {
+	if i == nil || i.Type != TypeList {
+		return nil, false
+	}
+	children, ok := i.Value.([]*Item)
+	if !ok {
+		return nil, false
+	}
+	return children, true
+}
+
+// AsBytes 读取字节数据
+func (i *Item) AsBytes() ([]byte, bool) {
+	if i == nil {
+		return nil, false
+	}
+	if i.Type != TypeBinary && i.Type != TypeJIS8 && i.Type != TypeASCII {
+		return nil, false
+	}
+	data, ok := i.Value.([]byte)
+	if !ok {
+		return nil, false
+	}
+	return data, true
+}
+
+// AsString 读取字符串数据
+func (i *Item) AsString() (string, bool) {
+	if i == nil || (i.Type != TypeASCII && i.Type != TypeJIS8) {
+		return "", false
+	}
+	switch v := i.Value.(type) {
+	case string:
+		return v, true
+	case []byte:
+		return string(v), true
+	default:
+		return "", false
+	}
+}
+
+// AsUint16Slice 读取 uint16 切片
+func (i *Item) AsUint16Slice() ([]uint16, bool) {
+	if i == nil || i.Type != TypeUInt16 {
+		return nil, false
+	}
+	vals, ok := i.Value.([]uint16)
+	if !ok {
+		return nil, false
+	}
+	return vals, true
+}
+
+// AsUint32Slice 读取 uint32 切片
+func (i *Item) AsUint32Slice() ([]uint32, bool) {
+	if i == nil || i.Type != TypeUInt32 {
+		return nil, false
+	}
+	vals, ok := i.Value.([]uint32)
+	if !ok {
+		return nil, false
+	}
+	return vals, true
+}
+
+// AsBoolSlice 读取 bool 切片
+func (i *Item) AsBoolSlice() ([]bool, bool) {
+	if i == nil || i.Type != TypeBoolean {
+		return nil, false
+	}
+	vals, ok := i.Value.([]bool)
+	if !ok {
+		return nil, false
+	}
+	return vals, true
+}
+
+// FirstUint 读取第一个无符号整数值
+func (i *Item) FirstUint() (uint64, bool) {
+	if i == nil {
+		return 0, false
+	}
+
+	switch i.Type {
+	case TypeUInt8:
+		vals, ok := i.Value.([]uint8)
+		if !ok || len(vals) == 0 {
+			return 0, false
+		}
+		return uint64(vals[0]), true
+	case TypeUInt16:
+		vals, ok := i.Value.([]uint16)
+		if !ok || len(vals) == 0 {
+			return 0, false
+		}
+		return uint64(vals[0]), true
+	case TypeUInt32:
+		vals, ok := i.Value.([]uint32)
+		if !ok || len(vals) == 0 {
+			return 0, false
+		}
+		return uint64(vals[0]), true
+	case TypeUInt64:
+		vals, ok := i.Value.([]uint64)
+		if !ok || len(vals) == 0 {
+			return 0, false
+		}
+		return vals[0], true
+	default:
+		return 0, false
+	}
+}

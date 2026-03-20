@@ -34,6 +34,7 @@ type SecsGem struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+	closed    bool
 
 	// 回调
 	msgHandler func(*Message) // 数据消息处理回调
@@ -45,25 +46,62 @@ type SecsGem struct {
 }
 
 // NewSecsGem 创建会话
-func NewSecsGem(deviceName string, config *Config, hsmsConnection *HSMSTransport, logger Logger, codec *ItemCodec) *SecsGem {
-	if logger == nil {
-		logger = NewSilentLogger()
-	}
+func NewSecsGem(deviceName string, config *Config, codec *ItemCodec) *SecsGem {
 	if codec == nil {
 		codec = DefaultItemCodec
 	}
-	hsmsConnection.logger = logger
-	secsGem := &SecsGem{
+	return &SecsGem{
 		deviceName: deviceName,
 		config:     config,
-		transport:  hsmsConnection,
-		logger:     logger,
+		logger:     NewSilentLogger(),
 		itemCodec:  codec,
 		done:       make(chan struct{}),
 	}
-	// 设置数据消息回调（所有数据会话由 secsgem 统一处理）
-	hsmsConnection.OnMessage(secsGem.handleDataMessage)
-	return secsGem
+}
+
+// BindTransport 显式绑定 transport、logger 与消息回调
+func (s *SecsGem) BindTransport(transport *HSMSTransport, logger Logger) {
+	if s == nil {
+		return
+	}
+	if logger == nil {
+		logger = NewSilentLogger()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	if s.transport != nil && transport != nil && s.transport != transport {
+		return
+	}
+	if s.transport != nil && s.transport != transport {
+		s.transport.OnMessage(nil)
+	}
+	if transport != nil {
+		transport.logger = logger
+		transport.OnMessage(s.handleDataMessage)
+	}
+
+	s.transport = transport
+	s.logger = logger
+}
+
+// UnbindTransport 显式解绑 transport 与消息回调
+func (s *SecsGem) UnbindTransport() {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.transport != nil {
+		s.transport.OnMessage(nil)
+	}
+	s.transport = nil
 }
 
 // OnMessage 设置数据消息处理回调（收到数据消息时调用）
@@ -80,6 +118,13 @@ func (s *SecsGem) OnMessage(handler func(*Message)) {
 // 这会吞掉断线错误（可能导致丢消息）；如果上层需要重试/告警，请不要使用该语义。
 func (s *SecsGem) Close() {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		if s.transport != nil {
+			s.transport.OnMessage(nil)
+			s.transport = nil
+		}
+		s.mu.Unlock()
 		close(s.done)
 	})
 	// 唤醒所有等待 reply 的 goroutine：投递一个空结果（err=nil, data=nil），使其按“无回复”返回。
@@ -107,6 +152,16 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("message is nil")
 	}
+	s.mu.RLock()
+	closed := s.closed
+	transport := s.transport
+	s.mu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("secsgem is closed")
+	}
+	if transport == nil {
+		return nil, fmt.Errorf("transport is not bound")
+	}
 
 	// 编码 Item
 	var itemData []byte
@@ -119,7 +174,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	}
 
 	// 构建 HSMSHeader
-	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, s.transport.NextSystemBytes())
+	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, transport.NextSystemBytes())
 	frameData := BuildCompleteFrame(header, itemData)
 	msg.applyProtocolSnapshot(header, itemData, frameData, time.Now())
 
@@ -130,7 +185,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 
 	// 无需回复的消息
 	if !msg.WBit {
-		if err := s.transport.Send(msg.RawFrame); err != nil {
+		if err := transport.Send(msg.RawFrame); err != nil {
 			return nil, fmt.Errorf("send failed: %w", err)
 		}
 		return nil, nil
@@ -156,6 +211,16 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 
 // SendReply 发送回复消息（使用原消息的 SystemBytes）
 func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
+	s.mu.RLock()
+	closed := s.closed
+	transport := s.transport
+	s.mu.RUnlock()
+	if closed {
+		return fmt.Errorf("secsgem is closed")
+	}
+	if transport == nil {
+		return fmt.Errorf("transport is not bound")
+	}
 	if origMsg == nil {
 		return fmt.Errorf("original message is nil")
 	}
@@ -184,11 +249,22 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 		FormatHexData(reply.RawFrame), FormatSML(reply.Item))
 
 	// 发送
-	return s.transport.Send(reply.RawFrame)
+	return transport.Send(reply.RawFrame)
 }
 
 // sendAndWait 发送并等待回复（独立收发机制）
 func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) (replyResult, error) {
+	s.mu.RLock()
+	closed := s.closed
+	transport := s.transport
+	s.mu.RUnlock()
+	if closed {
+		return replyResult{}, fmt.Errorf("secsgem is closed")
+	}
+	if transport == nil {
+		return replyResult{}, fmt.Errorf("transport is not bound")
+	}
+
 	systemBytes := header.SystemBytes
 
 	// 创建回复通道
@@ -201,7 +277,7 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) (replyResult,
 	}()
 
 	// 发送
-	if err := s.transport.Send(frameData); err != nil {
+	if err := transport.Send(frameData); err != nil {
 		s.logger.Error("[%v] send failed: %v", header.SystemBytes, err)
 		return replyResult{}, err
 	}
@@ -219,7 +295,7 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) (replyResult,
 	case <-s.done:
 		// 会话关闭：视为无回复
 		return replyResult{}, nil
-	case <-s.transport.ConnDone():
+	case <-transport.ConnDone():
 		// 连接断开：视为无回复
 		return replyResult{}, nil
 	case <-timer.C:
@@ -230,6 +306,12 @@ func (s *SecsGem) sendAndWait(frameData []byte, header HSMSHeader) (replyResult,
 
 // handleDataMessage 处理收到的数据消息（所有数据会话统一处理）
 func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		return
+	}
 
 	msg, err := ParseMessage(header, itemData, s.itemCodec)
 	if err != nil {
@@ -270,13 +352,6 @@ func (s *SecsGem) handleReply(header HSMSHeader, itemData []byte) bool {
 // logReceivedData 记录数据消息接收日志
 func (s *SecsGem) logReceivedData(msg *Message) {
 	rawFrame := msg.RawFrame
-	if len(rawFrame) == 0 {
-		header := msg.Header
-		if header.SystemBytes == 0 && msg.SystemBytes != 0 {
-			header = BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, msg.SystemBytes)
-		}
-		rawFrame = BuildCompleteFrame(header, msg.RawData)
-	}
 	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(rawFrame), FormatSML(msg.Item))
 }
 
@@ -300,5 +375,8 @@ func (s *SecsGem) IsActive() bool {
 
 // IsSelected 检查是否已 Select
 func (s *SecsGem) IsSelected() bool {
+	if s.transport == nil {
+		return false
+	}
 	return s.transport.IsSelected()
 }

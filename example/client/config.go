@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
+	"github.com/jianwushu/Secs4go/example/sharedcfg"
 	"github.com/jianwushu/Secs4go/secs4go"
 )
 
@@ -41,7 +41,10 @@ func parseClientOptions(args []string) (clientOptions, error) {
 	fs.SetOutput(io.Discard)
 
 	opts := defaultClientOptions()
-	var deviceID uint
+	var (
+		deviceID uint
+		err      error
+	)
 
 	fs.StringVar(&opts.Address, "addr", opts.Address, "server address")
 	fs.UintVar(&deviceID, "device-id", uint(opts.DeviceID), "client device id")
@@ -58,22 +61,17 @@ func parseClientOptions(args []string) (clientOptions, error) {
 		return clientOptions{}, fmt.Errorf("device-id must be <= %d", uint(^uint16(0)))
 	}
 	opts.DeviceID = uint16(deviceID)
-	opts.Address = strings.TrimSpace(opts.Address)
-	opts.ItemAEncoding = strings.TrimSpace(opts.ItemAEncoding)
-	if opts.ItemAEncoding == "" {
-		opts.ItemAEncoding = defaultClientItemAEncoding
+	opts.Address, err = sharedcfg.NormalizeAddress(opts.Address)
+	if err != nil {
+		return clientOptions{}, err
 	}
-	if opts.Address == "" {
-		return clientOptions{}, fmt.Errorf("addr is required")
-	}
+	opts.ItemAEncoding = sharedcfg.NormalizeItemAEncoding(opts.ItemAEncoding, defaultClientItemAEncoding)
 	if opts.T3 <= 0 {
 		return clientOptions{}, fmt.Errorf("t3 must be positive")
 	}
-	switch strings.ToLower(opts.LogLevel) {
-	case "debug", "info", "warn", "error":
-		opts.LogLevel = strings.ToLower(opts.LogLevel)
-	default:
-		return clientOptions{}, fmt.Errorf("log-level must be one of: debug, info, warn, error")
+	opts.LogLevel, err = sharedcfg.NormalizeLogLevel(opts.LogLevel)
+	if err != nil {
+		return clientOptions{}, err
 	}
 
 	return opts, nil
