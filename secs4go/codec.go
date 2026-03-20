@@ -107,8 +107,8 @@ func BuildCompleteFrame(header HSMSHeader, itemData []byte) []byte {
 // SML 格式化
 // ============================================================
 
-// formatSMLWithIndent 格式化Item为SML格式 (带缩进)
-func formatSMLWithIndent(item *Item, indent int) string {
+// formatSMLWithIndentAndCodec 格式化Item为SML格式 (带缩进 + codec)
+func formatSMLWithIndentAndCodec(item *Item, indent int, codec *ItemCodec) string {
 	if item == nil {
 		return "."
 	}
@@ -127,7 +127,7 @@ func formatSMLWithIndent(item *Item, indent int) string {
 
 		childParts := make([]string, len(children))
 		for i, child := range children {
-			childParts[i] = formatSMLWithIndent(child, indent+1)
+			childParts[i] = formatSMLWithIndentAndCodec(child, indent+1, codec)
 		}
 		return fmt.Sprintf("%s<L[%d]\n%s\n%s>", indentStr, len(children), strings.Join(childParts, "\n"), indentStr)
 
@@ -143,11 +143,11 @@ func formatSMLWithIndent(item *Item, indent int) string {
 		return fmt.Sprintf("%s<B[%d] %s>", indentStr, len(data), strings.Join(hex, " "))
 
 	case TypeASCII:
-		data, ok := item.Value.([]byte)
-		if !ok {
-			return fmt.Sprintf("%s<invalid ascii>", indentStr)
+		str, dataLen, err := decodeItemAForDisplay(item, codec)
+		if err != nil {
+			return fmt.Sprintf("%s<A[%d] invalid-%s:%s>", indentStr, dataLen, codecEncodingName(codec), err)
 		}
-		return fmt.Sprintf("%s<A[%d] \"%s\">", indentStr, len(data), string(data))
+		return fmt.Sprintf("%s<A[%d] \"%s\">", indentStr, dataLen, str)
 
 	case TypeJIS8:
 		data, ok := item.Value.([]byte)
@@ -271,7 +271,60 @@ func formatSMLWithIndent(item *Item, indent int) string {
 	}
 }
 
+// FormatSMLWithCodec 按当前编解码器格式化Item为SML格式
+func FormatSMLWithCodec(item *Item, codec *ItemCodec) string {
+	if codec == nil {
+		codec = DefaultItemCodec
+	}
+	return formatSMLWithIndentAndCodec(item, 0, codec)
+}
+
 // FormatSML 格式化Item为SML格式
 func FormatSML(item *Item) string {
-	return formatSMLWithIndent(item, 0)
+	return FormatSMLWithCodec(item, DefaultItemCodec)
+}
+
+func decodeItemAForDisplay(item *Item, codec *ItemCodec) (string, int, error) {
+	if item == nil {
+		return "", 0, nil
+	}
+	if codec == nil {
+		codec = DefaultItemCodec
+	}
+
+	switch v := item.Value.(type) {
+	case string:
+		encoded, err := codec.encodeString(v)
+		if err != nil {
+			return "", len([]byte(v)), err
+		}
+		decoded, err := codec.decodeString(encoded)
+		if err != nil {
+			return "", len(encoded), err
+		}
+		str, ok := decoded.(string)
+		if !ok {
+			return "", len(encoded), fmt.Errorf("decoded A item is not string")
+		}
+		return str, len(encoded), nil
+	case []byte:
+		decoded, err := codec.decodeString(v)
+		if err != nil {
+			return "", len(v), err
+		}
+		str, ok := decoded.(string)
+		if !ok {
+			return "", len(v), fmt.Errorf("decoded A item is not string")
+		}
+		return str, len(v), nil
+	default:
+		return "", 0, fmt.Errorf("invalid ascii")
+	}
+}
+
+func codecEncodingName(codec *ItemCodec) string {
+	if codec == nil || codec.encodingName == "" {
+		return "ASCII"
+	}
+	return codec.encodingName
 }

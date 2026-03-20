@@ -34,7 +34,7 @@ func B(data ...byte) *Item {
 func A(data string) *Item {
 	return &Item{
 		Type:  TypeASCII,
-		Value: []byte(data),
+		Value: data,
 	}
 }
 
@@ -254,11 +254,14 @@ func (i *Item) AsBytes() ([]byte, bool) {
 	if i.Type != TypeBinary && i.Type != TypeJIS8 && i.Type != TypeASCII {
 		return nil, false
 	}
-	data, ok := i.Value.([]byte)
-	if !ok {
+	switch v := i.Value.(type) {
+	case []byte:
+		return v, true
+	case string:
+		return []byte(v), true
+	default:
 		return nil, false
 	}
-	return data, true
 }
 
 // AsString 读取字符串数据

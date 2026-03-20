@@ -28,8 +28,9 @@ var (
 
 // ItemCodec 负责 Item 的编解码，支持配置字符串编码
 type ItemCodec struct {
-	encoder *encoding.Encoder
-	decoder *encoding.Decoder
+	encodingName string
+	encoder      *encoding.Encoder
+	decoder      *encoding.Decoder
 }
 
 // NewItemCodec 创建新的编解码器
@@ -42,13 +43,15 @@ func NewItemCodec(encodingName string) (*ItemCodec, error) {
 		enc = simplifiedchinese.GBK
 	case "GB2312":
 		enc = simplifiedchinese.GB18030 // GB18030 兼容 GB2312
-	case "UTF-8", "ASCII":
-		enc = nil // UTF-8/ASCII 直接使用原始字节
+	case "UTF-8":
+		enc = nil // UTF-8 直接使用原始字节
+	case "ASCII":
+		enc = nil // ASCII 走严格 7-bit 校验
 	default:
 		return nil, fmt.Errorf("unsupported ItemAEncoding %q", encodingName)
 	}
 
-	codec := &ItemCodec{}
+	codec := &ItemCodec{encodingName: normalizedName}
 	if enc != nil {
 		codec.encoder = enc.NewEncoder()
 		codec.decoder = enc.NewDecoder()
@@ -57,7 +60,7 @@ func NewItemCodec(encodingName string) (*ItemCodec, error) {
 	return codec, nil
 }
 
-// DefaultItemCodec 默认编解码器 (UTF-8/ASCII)
+// DefaultItemCodec 默认编解码器 (严格 ASCII)
 var DefaultItemCodec, _ = NewItemCodec("ASCII")
 
 // EncodeItem 编码Item
@@ -308,34 +311,57 @@ func (c *ItemCodec) itemBytesToValue(itemType ItemType, data []byte) (interface{
 // ============================================================
 
 func (c *ItemCodec) encodeString(value interface{}) ([]byte, error) {
-	str, ok := value.(string)
-	if !ok {
-		// 尝试转换 []byte
-		if b, ok := value.([]byte); ok {
-			str = string(b)
-		} else {
-			return nil, ErrInvalidValue
+	var data []byte
+	switch v := value.(type) {
+	case string:
+		data = []byte(v)
+	case []byte:
+		data = v
+	default:
+		return nil, ErrInvalidValue
+	}
+
+	if c.encodingName == "ASCII" {
+		if err := validateASCIIBytes(data); err != nil {
+			return nil, fmt.Errorf("encode ASCII string failed: %w", err)
 		}
+		return data, nil
 	}
 
 	if c.encoder == nil {
-		return []byte(str), nil
+		return data, nil
 	}
 
-	data, _, err := transform.Bytes(c.encoder, []byte(str))
-	return data, err
+	encoded, _, err := transform.Bytes(c.encoder, data)
+	return encoded, err
 }
 
 func (c *ItemCodec) decodeString(data []byte) (interface{}, error) {
+	if c.encodingName == "ASCII" {
+		if err := validateASCIIBytes(data); err != nil {
+			return nil, fmt.Errorf("decode ASCII string failed: %w", err)
+		}
+		return string(data), nil
+	}
+
 	if c.decoder == nil {
-		return data, nil
+		return string(data), nil
 	}
 
 	decoded, _, err := transform.Bytes(c.decoder, data)
 	if err != nil {
 		return nil, fmt.Errorf("decode string failed: %w", err)
 	}
-	return decoded, nil
+	return string(decoded), nil
+}
+
+func validateASCIIBytes(data []byte) error {
+	for i, b := range data {
+		if b > 0x7F {
+			return fmt.Errorf("non-ASCII byte at index %d: 0x%02X", i, b)
+		}
+	}
+	return nil
 }
 
 // ============================================================

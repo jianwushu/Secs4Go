@@ -181,7 +181,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 日志
 	s.logger.Info(">>> Send S%dF%d(W=%v, SysBytes=%d)\n%s\n%s",
 		msg.Stream, msg.Function, msg.WBit, header.SystemBytes,
-		FormatHexData(msg.RawFrame), FormatSML(msg.Item))
+		FormatHexData(msg.RawFrame), FormatSMLWithCodec(msg.Item, s.itemCodec))
 
 	// 无需回复的消息
 	if !msg.WBit {
@@ -246,7 +246,7 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	// 日志
 	s.logger.Info(">>> Send S%dF%d(W=false, SysBytes=%d)\n%s\n%s",
 		reply.Stream, reply.Function, header.SystemBytes,
-		FormatHexData(reply.RawFrame), FormatSML(reply.Item))
+		FormatHexData(reply.RawFrame), FormatSMLWithCodec(reply.Item, s.itemCodec))
 
 	// 发送
 	return transport.Send(reply.RawFrame)
@@ -352,7 +352,7 @@ func (s *SecsGem) handleReply(header HSMSHeader, itemData []byte) bool {
 // logReceivedData 记录数据消息接收日志
 func (s *SecsGem) logReceivedData(msg *Message) {
 	rawFrame := msg.RawFrame
-	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(rawFrame), FormatSML(msg.Item))
+	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(rawFrame), FormatSMLWithCodec(msg.Item, s.itemCodec))
 }
 
 // sendDefaultReply 发送默认回复 (上层未处理时)

@@ -13,7 +13,7 @@ import (
 const (
 	defaultServerAddress       = "127.0.0.1:7000"
 	defaultClientT3            = 10 * time.Second
-	defaultClientItemAEncoding = "ASCII"
+	defaultClientItemAEncoding = "GBK"
 )
 
 type clientOptions struct {
