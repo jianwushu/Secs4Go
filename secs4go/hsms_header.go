@@ -17,6 +17,7 @@ type HSMSHeader struct {
 	PType       PType  // 1 byte
 	SType       SType  // 1 byte
 	SystemBytes uint32 // 4 bytes
+	RawFrame    []byte
 }
 
 // ============================================================
@@ -54,38 +55,17 @@ func BuildControlHeader(sType SType, systemBytes uint32, status byte) HSMSHeader
 
 // BuildSelectRspHeader 构建Select.rsp头
 func BuildSelectRspHeader(systemBytes uint32, status byte) HSMSHeader {
-	return HSMSHeader{
-		SessionID:   0xFFFF,
-		HeaderByte2: 0,
-		HeaderByte3: status,
-		PType:       PTypeSECSII,
-		SType:       STypeSelectRsp,
-		SystemBytes: systemBytes,
-	}
+	return BuildControlHeader(STypeSelectRsp, systemBytes, status)
 }
 
 // BuildDeselectRspHeader 构建Deselect.rsp头
 func BuildDeselectRspHeader(systemBytes uint32, status byte) HSMSHeader {
-	return HSMSHeader{
-		SessionID:   0xFFFF,
-		HeaderByte2: 0,
-		HeaderByte3: status,
-		PType:       PTypeSECSII,
-		SType:       STypeDeselectRsp,
-		SystemBytes: systemBytes,
-	}
+	return BuildControlHeader(STypeDeselectRsp, systemBytes, status)
 }
 
 // BuildRejectReqHeader 构建Reject.req头
 func BuildRejectReqHeader(systemBytes uint32, reason byte) HSMSHeader {
-	return HSMSHeader{
-		SessionID:   0xFFFF,
-		HeaderByte2: 0,
-		HeaderByte3: reason,
-		PType:       PTypeSECSII,
-		SType:       STypeRejectReq,
-		SystemBytes: systemBytes,
-	}
+	return BuildControlHeader(STypeRejectReq, systemBytes, reason)
 }
 
 // ============================================================
@@ -115,6 +95,7 @@ func DecodeHeader(data []byte) HSMSHeader {
 		PType:       PType(data[4]),
 		SType:       SType(data[5]),
 		SystemBytes: binary.BigEndian.Uint32(data[6:10]),
+		RawFrame:    data,
 	}
 }
 

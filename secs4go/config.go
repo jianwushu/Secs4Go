@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Config 配置结构 - 所有参数都有SEMI标准默认值
+// Config 配置结构
 type Config struct {
 	// 必填参数
 	Address string // "127.0.0.1:5000" 或 ":5000"
@@ -32,6 +32,9 @@ type Config struct {
 	EnableHeartbeat   bool          // 默认: true
 	HeartbeatInterval time.Duration // 默认: 60s
 
+	// 开启S9FX报警通知
+	EnableS9FX bool // 默认: true
+
 	// 编码配置
 	ItemAEncoding string // 默认: "ASCII" (支持 "ASCII", "GBK", "UTF-8", "GB2312")
 }
@@ -51,6 +54,7 @@ func DefaultConfig(address string) *Config {
 		MaxReconnectTries: -1, // 无限重试
 		EnableHeartbeat:   true,
 		HeartbeatInterval: 60 * time.Second,
+		EnableS9FX:        true,
 		ItemAEncoding:     "ASCII",
 	}
 }

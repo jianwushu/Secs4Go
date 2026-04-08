@@ -65,12 +65,6 @@ type HSMSTransport struct {
 
 // NewHSMSTransport 创建传输层
 func NewHSMSTransport(config *Config) *HSMSTransport {
-	var t6, t7 time.Duration
-	if config != nil {
-		t6 = config.T6
-		t7 = config.T7
-	}
-
 	// 初始为 disconnected：不预先塞一个“已关闭”的 connDone。
 	// 否则后续断连/Stop 时再次 close 会触发 panic: close of closed channel。
 	// 当 connDone == nil 时，ConnDone() 会返回一个临时的已关闭通道，供等待方立即退出。
@@ -78,8 +72,8 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 		config:           config,
 		state:            StateDisconnected,
 		logger:           NewSilentLogger(),
-		t6Timer:          time.NewTimer(t6),
-		t7Timer:          time.NewTimer(t7),
+		t6Timer:          time.NewTimer(config.T6),
+		t7Timer:          time.NewTimer(config.T7),
 		controlReplyChan: make(chan struct{}, 1),
 		connDone:         nil,
 		stopChan:         make(chan struct{}),
