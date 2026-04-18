@@ -318,12 +318,22 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 		s.logger.Error("Failed to parse message: %v", err)
 		return
 	}
+
 	// 记录接收日志
 	s.logReceivedData(msg)
 
 	// 优先按 pending request 关联 reply；未命中时按普通上行消息处理。
 	if s.handleReply(header, itemData) {
 		return
+	}
+
+	// S9F1 检查
+	if header.SessionID != s.config.DeviceID {
+		if msg.WBit && s.config.EnableS9FX {
+			reply := NewMessage(9, 1).WithItem(B(header.RawFrame...))
+			s.SendReply(msg, reply)
+			return
+		}
 	}
 
 	// 主消息：向上层回调（复制handler引用，避免竞态）

@@ -28,7 +28,7 @@ type clientOptions struct {
 func defaultClientOptions() clientOptions {
 	return clientOptions{
 		Address:         defaultServerAddress,
-		DeviceID:        0,
+		DeviceID:        1,
 		T3:              defaultClientT3,
 		ItemAEncoding:   defaultClientItemAEncoding,
 		EnableHeartbeat: true,
@@ -84,5 +84,6 @@ func buildClientConfig(opts clientOptions) *secs4go.Config {
 	config.IsActive = true
 	config.EnableHeartbeat = opts.EnableHeartbeat
 	config.ItemAEncoding = opts.ItemAEncoding
+	config.EnableS9FX = true
 	return config
 }

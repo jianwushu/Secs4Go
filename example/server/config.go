@@ -105,5 +105,6 @@ func buildServerConfig(opts serverOptions) *secs4go.Config {
 	config.IsActive = false
 	config.EnableHeartbeat = false
 	config.ItemAEncoding = opts.ItemAEncoding
+	config.EnableS9FX = true
 	return config
 }
