@@ -16,7 +16,7 @@ const (
 	defaultEventInterval       = 2 * time.Second
 	defaultEventInitialDelay   = 1 * time.Second
 	defaultSelectedPoll        = 500 * time.Millisecond
-	defaultServerItemAEncoding = "GBK"
+	defaultServerItemAEncoding = "ASCII"
 )
 
 type serverOptions struct {

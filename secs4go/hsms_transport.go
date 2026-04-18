@@ -599,22 +599,10 @@ func (t *HSMSTransport) SendControlAndWait(header HSMSHeader) error {
 	}
 }
 
-// SendSelectRsp 服务端: 发送 Select.rsp 响应
-func (t *HSMSTransport) SendSelectRsp(systemBytes uint32, status byte) {
-	header := BuildSelectRspHeader(systemBytes, status)
-	t.SendControl(header)
-}
-
 // LinkTest 发送 LinkTest 请求 (使用 T6)
 func (t *HSMSTransport) LinkTestReq() error {
 	header := BuildControlHeader(STypeLinktestReq, t.NextSystemBytes(), 0)
 	return t.SendControlAndWait(header)
-}
-
-// SendDeselectRsp 服务端: 发送 Deselect.rsp 响应
-func (t *HSMSTransport) SendDeselectRsp(systemBytes uint32, status byte) {
-	header := BuildDeselectRspHeader(systemBytes, status)
-	t.SendControl(header)
 }
 
 // SendRejectRsp 服务端: 发送 Reject.rsp 响应
@@ -878,13 +866,13 @@ func (t *HSMSTransport) sendLinkTestRsp(systemBytes uint32) {
 
 // sendSelectRsp 发送 Select.rsp
 func (t *HSMSTransport) sendSelectRsp(systemBytes uint32, status byte) {
-	header := BuildSelectRspHeader(systemBytes, status)
+	header := BuildControlHeader(STypeSelectRsp, systemBytes, status)
 	t.SendControl(header)
 }
 
 // sendDeselectRsp 发送 Deselect.rsp
 func (t *HSMSTransport) sendDeselectRsp(systemBytes uint32, status byte) {
-	header := BuildDeselectRspHeader(systemBytes, status)
+	header := BuildControlHeader(STypeDeselectRsp, systemBytes, status)
 	t.SendControl(header)
 }
 

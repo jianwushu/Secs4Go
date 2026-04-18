@@ -53,16 +53,6 @@ func BuildControlHeader(sType SType, systemBytes uint32, status byte) HSMSHeader
 	}
 }
 
-// BuildSelectRspHeader 构建Select.rsp头
-func BuildSelectRspHeader(systemBytes uint32, status byte) HSMSHeader {
-	return BuildControlHeader(STypeSelectRsp, systemBytes, status)
-}
-
-// BuildDeselectRspHeader 构建Deselect.rsp头
-func BuildDeselectRspHeader(systemBytes uint32, status byte) HSMSHeader {
-	return BuildControlHeader(STypeDeselectRsp, systemBytes, status)
-}
-
 // BuildRejectReqHeader 构建Reject.req头
 func BuildRejectReqHeader(systemBytes uint32, reason byte) HSMSHeader {
 	return BuildControlHeader(STypeRejectReq, systemBytes, reason)
@@ -82,7 +72,6 @@ func (h *HSMSHeader) Encode() []byte {
 	buf[4] = uint8(h.PType)
 	buf[5] = uint8(h.SType)
 	binary.BigEndian.PutUint32(buf[6:10], h.SystemBytes)
-
 	return buf
 }
 

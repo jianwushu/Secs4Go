@@ -7,6 +7,7 @@ import (
 	"math"
 
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/ianaindex"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 )
@@ -44,17 +45,18 @@ func NewItemCodec(encodingName string) (*ItemCodec, error) {
 	case "GB2312":
 		enc = simplifiedchinese.GB18030 // GB18030 兼容 GB2312
 	case "UTF-8":
-		enc = nil // UTF-8 直接使用原始字节
+		enc = encoding.Nop
 	case "ASCII":
-		enc = nil // ASCII 走严格 7-bit 校验
+		enc, _ = ianaindex.IANA.Encoding("US-ASCII")
 	default:
 		return nil, fmt.Errorf("unsupported ItemAEncoding %q", encodingName)
 	}
 
 	codec := &ItemCodec{encodingName: normalizedName}
 	if enc != nil {
-		codec.encoder = enc.NewEncoder()
+		codec.encoder = encoding.ReplaceUnsupported(enc.NewEncoder()) // 乱码替换为? 可能会不打印
 		codec.decoder = enc.NewDecoder()
+
 	}
 
 	return codec, nil
@@ -108,11 +110,12 @@ func (c *ItemCodec) EncodeItem(item *Item) ([]byte, error) {
 	result[0] = formatByte
 
 	// 写入长度
-	if lenBytes == 1 {
+	switch lenBytes {
+	case 1:
 		result[1] = byte(dataLen)
-	} else if lenBytes == 2 {
+	case 2:
 		binary.BigEndian.PutUint16(result[1:3], uint16(dataLen))
-	} else {
+	default:
 		result[1] = byte(dataLen >> 16)
 		result[2] = byte(dataLen >> 8)
 		result[3] = byte(dataLen)
@@ -142,11 +145,12 @@ func (c *ItemCodec) encodeListItem(value interface{}) ([]byte, error) {
 	}
 
 	formatByte := byte(TypeList) << 2
-	if lenBytes == 1 {
+	switch lenBytes {
+	case 1:
 		formatByte |= 0x01
-	} else if lenBytes == 2 {
+	case 2:
 		formatByte |= 0x02
-	} else {
+	default:
 		formatByte |= 0x03
 	}
 
@@ -162,11 +166,12 @@ func (c *ItemCodec) encodeListItem(value interface{}) ([]byte, error) {
 	result := make([]byte, 1+lenBytes+len(itemData))
 	result[0] = formatByte
 
-	if lenBytes == 1 {
+	switch lenBytes {
+	case 1:
 		result[1] = byte(count)
-	} else if lenBytes == 2 {
+	case 2:
 		binary.BigEndian.PutUint16(result[1:3], uint16(count))
-	} else {
+	default:
 		result[1] = byte(count >> 16)
 		result[2] = byte(count >> 8)
 		result[3] = byte(count)
@@ -224,11 +229,12 @@ func (c *ItemCodec) DecodeItem(data []byte) (*Item, int, error) {
 	var length int
 	headerLen := 1 + lengthBytes
 
-	if lengthBytes == 1 {
+	switch lengthBytes {
+	case 1:
 		length = int(data[1])
-	} else if lengthBytes == 2 {
+	case 2:
 		length = int(binary.BigEndian.Uint16(data[1:3]))
-	} else if lengthBytes == 3 {
+	case 3:
 		length = int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 	}
 
@@ -321,13 +327,6 @@ func (c *ItemCodec) encodeString(value interface{}) ([]byte, error) {
 		return nil, ErrInvalidValue
 	}
 
-	if c.encodingName == "ASCII" {
-		if err := validateASCIIBytes(data); err != nil {
-			return nil, fmt.Errorf("encode ASCII string failed: %w", err)
-		}
-		return data, nil
-	}
-
 	if c.encoder == nil {
 		return data, nil
 	}
@@ -336,13 +335,7 @@ func (c *ItemCodec) encodeString(value interface{}) ([]byte, error) {
 	return encoded, err
 }
 
-func (c *ItemCodec) decodeString(data []byte) (interface{}, error) {
-	if c.encodingName == "ASCII" {
-		if err := validateASCIIBytes(data); err != nil {
-			return nil, fmt.Errorf("decode ASCII string failed: %w", err)
-		}
-		return string(data), nil
-	}
+func (c *ItemCodec) decodeString(data []byte) (string, error) {
 
 	if c.decoder == nil {
 		return string(data), nil
@@ -350,18 +343,9 @@ func (c *ItemCodec) decodeString(data []byte) (interface{}, error) {
 
 	decoded, _, err := transform.Bytes(c.decoder, data)
 	if err != nil {
-		return nil, fmt.Errorf("decode string failed: %w", err)
+		return "", fmt.Errorf("decode string failed: %w", err)
 	}
 	return string(decoded), nil
-}
-
-func validateASCIIBytes(data []byte) error {
-	for i, b := range data {
-		if b > 0x7F {
-			return fmt.Errorf("non-ASCII byte at index %d: 0x%02X", i, b)
-		}
-	}
-	return nil
 }
 
 // ============================================================

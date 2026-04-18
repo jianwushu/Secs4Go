@@ -1,6 +1,7 @@
 package secs4go
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,38 +14,6 @@ import (
 
 var ErrInvalidFrame = errors.New("invalid HSMS frame")
 
-// ============================================================
-// 字节序转换工具
-// ============================================================
-
-// EncodeUint32 uint32 转大端字节数组
-func EncodeUint32(v uint32) []byte {
-	b := make([]byte, 4)
-	b[0] = byte(v >> 24)
-	b[1] = byte(v >> 16)
-	b[2] = byte(v >> 8)
-	b[3] = byte(v)
-	return b
-}
-
-// EncodeUint16 uint16 转大端字节数组
-func EncodeUint16(v uint16) []byte {
-	b := make([]byte, 2)
-	b[0] = byte(v >> 8)
-	b[1] = byte(v)
-	return b
-}
-
-// DecodeUint32 大端字节数组转 uint32
-func DecodeUint32(b []byte) uint32 {
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-// DecodeUint16 大端字节数组转 uint16
-func DecodeUint16(b []byte) uint16 {
-	return uint16(b[0])<<8 | uint16(b[1])
-}
-
 // ReadHSMSFrame 读取HSMS帧
 // 返回: 头部(10字节), SECS-II数据(Item), 错误
 func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
@@ -54,7 +23,7 @@ func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
 		return HSMSHeader{}, nil, err
 	}
 
-	frameLen := DecodeUint32(lengthBuf)
+	frameLen := binary.BigEndian.Uint32(lengthBuf)
 	if frameLen < HSMSHeaderLength {
 		return HSMSHeader{}, nil, ErrInvalidFrame
 	}
@@ -98,7 +67,9 @@ func FormatHexData(data []byte) string {
 // BuildCompleteFrame 格式化完整帧数据 (4B长度 + 10B头部 + 数据)
 func BuildCompleteFrame(header HSMSHeader, itemData []byte) []byte {
 	headerBytes := header.Encode()
-	frameBytes := append(EncodeUint32(uint32(len(headerBytes)+len(itemData))), headerBytes...)
+	lengthBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBuf, uint32(len(headerBytes)+len(itemData)))
+	frameBytes := append(lengthBuf, headerBytes...)
 	frameBytes = append(frameBytes, itemData...)
 	return frameBytes
 }
@@ -302,21 +273,13 @@ func decodeItemAForDisplay(item *Item, codec *ItemCodec) (string, int, error) {
 		if err != nil {
 			return "", len(encoded), err
 		}
-		str, ok := decoded.(string)
-		if !ok {
-			return "", len(encoded), fmt.Errorf("decoded A item is not string")
-		}
-		return str, len(encoded), nil
+		return decoded, len(encoded), nil
 	case []byte:
 		decoded, err := codec.decodeString(v)
 		if err != nil {
 			return "", len(v), err
 		}
-		str, ok := decoded.(string)
-		if !ok {
-			return "", len(v), fmt.Errorf("decoded A item is not string")
-		}
-		return str, len(v), nil
+		return decoded, len(v), nil
 	default:
 		return "", 0, fmt.Errorf("invalid ascii")
 	}

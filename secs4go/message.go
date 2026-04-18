@@ -85,28 +85,6 @@ func (m *Message) applyProtocolSnapshot(header HSMSHeader, itemData []byte, fram
 	m.Timestamp = timestamp
 }
 
-// ============================================================
-// Message <-> HSMSHeader 转换
-// ============================================================
-
-// BuildHSMSHeader Message → HSMSHeader
-// 将Message的S/F/WBit提取到HSMSHeader
-func BuildHSMSHeader(deviceID uint16, msg *Message, sType SType, systemBytes uint32) HSMSHeader {
-	headerByte2 := msg.Stream & 0x7F
-	if msg.WBit {
-		headerByte2 |= 0x80
-	}
-
-	return HSMSHeader{
-		SessionID:   deviceID,
-		HeaderByte2: headerByte2,
-		HeaderByte3: msg.Function,
-		PType:       PTypeSECSII,
-		SType:       sType,
-		SystemBytes: systemBytes,
-	}
-}
-
 // ParseMessage HSMSHeader + []byte → Message
 // 从HSMSHeader提取S/F/WBit，解析Item
 func ParseMessage(header HSMSHeader, data []byte, codec *ItemCodec) (*Message, error) {
