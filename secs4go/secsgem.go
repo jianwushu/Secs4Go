@@ -323,25 +323,25 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 	s.logReceivedData(msg)
 
 	// 优先按 pending request 关联 reply；未命中时按普通上行消息处理。
-	if s.handleReply(header, itemData) {
+	if !msg.WBit && s.handleReply(header, itemData) {
 		return
 	}
 
 	// S9F1 检查
-	if header.SessionID != s.config.DeviceID {
-		if msg.WBit && s.config.EnableS9FX {
+	if msg.WBit && s.config.EnableS9FX {
+		if header.SessionID != s.config.DeviceID {
 			reply := NewMessage(9, 1).WithItem(B(header.RawFrame...))
 			s.SendReply(msg, reply)
 			return
 		}
 	}
 
-	// 主消息：向上层回调（复制handler引用，避免竞态）
+	// 主消息：向上层回调
 	s.mu.RLock()
 	handler := s.msgHandler
 	s.mu.RUnlock()
 
-	// 使用复制后的handler（解锁后可能已被修改，但复制值不变）
+	// 使用复制后的handler
 	if handler != nil {
 		handler(msg)
 	}
@@ -371,7 +371,6 @@ func (s *SecsGem) SendDefaultReply(msg *Message) {
 		reply := NewMessage(msg.Stream, msg.Function+1).WithItem(B(0))
 		s.SendReply(msg, reply)
 	}
-
 }
 
 // ============================================================
