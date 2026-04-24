@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultListenAddress       = ":7000"
+	defaultListenAddress       = ":5000"
 	defaultServerT3            = 10 * time.Second
 	defaultEventInterval       = 2 * time.Second
 	defaultEventInitialDelay   = 1 * time.Second
