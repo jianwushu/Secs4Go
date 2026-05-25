@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/jianwushu/Secs4go/example/sharedcfg"
+	"github.com/jianwushu/Secs4go/sec4go.extension/sml"
 	"github.com/jianwushu/Secs4go/secs4go"
 )
 
@@ -34,6 +35,7 @@ func NewClientApp(opts clientOptions) (*ClientApp, error) {
 
 	logger := secs4go.NewFileLoggerWithLevel("TEST", sharedcfg.ParseLogLevel(opts.LogLevel))
 	client := secs4go.NewSecsGem("TEST", config, codec)
+	client.WithMessageFormatter(sml.ToSMLWithHex)
 	client.BindTransport(transport, logger)
 
 	app := &ClientApp{
@@ -80,6 +82,7 @@ func (app *ClientApp) handleMessage(msg *secs4go.Message) {
 		if err := app.client.SendReply(msg, reply); err != nil {
 			log.Printf("发送 S6F12 失败: %v", err)
 		}
+		// log.Printf("SML: %s", sml.ToSML(msg))
 	default:
 		app.client.SendDefaultReply(msg)
 	}

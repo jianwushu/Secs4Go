@@ -19,6 +19,8 @@ type replyResult struct {
 	err    error
 }
 
+type MessageFormatter func(msg *Message) string
+
 // ============================================================
 // SecsGem - SECS/GEM 应用层封装
 // 职责: 封装 HSMSTransport，提供简洁的应用层 API 仅处理数据消息（Message）的发送
@@ -43,6 +45,14 @@ type SecsGem struct {
 
 	// 独立收发机制：使用 SystemBytes 关联请求和回复
 	pendingReplies sync.Map // map[uint32]chan replyResult
+
+	msgFormatter MessageFormatter
+}
+
+// WithMessageFormatter 设置消息格式化器
+func (s *SecsGem) WithMessageFormatter(f MessageFormatter) *SecsGem {
+	s.msgFormatter = f
+	return s
 }
 
 // NewSecsGem 创建会话
@@ -179,9 +189,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	msg.applyProtocolSnapshot(header, itemData, frameData, time.Now())
 
 	// 日志
-	s.logger.Info(">>> Send S%dF%d(W=%v, SysBytes=%d)\n%s\n%s",
-		msg.Stream, msg.Function, msg.WBit, header.SystemBytes,
-		FormatHexData(msg.RawFrame), FormatSMLWithCodec(msg.Item, s.itemCodec))
+	s.logger.Info(">>> Send %v", s.msgFormatter(msg))
 
 	// 无需回复的消息
 	if !msg.WBit {
@@ -244,9 +252,7 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	reply.applyProtocolSnapshot(header, itemData, frameData, time.Now())
 
 	// 日志
-	s.logger.Info(">>> Send S%dF%d(W=false, SysBytes=%d)\n%s\n%s",
-		reply.Stream, reply.Function, header.SystemBytes,
-		FormatHexData(reply.RawFrame), FormatSMLWithCodec(reply.Item, s.itemCodec))
+	s.logger.Info(">>> Send %v", s.msgFormatter(reply))
 
 	// 发送
 	return transport.Send(reply.RawFrame)
@@ -361,8 +367,7 @@ func (s *SecsGem) handleReply(header HSMSHeader, itemData []byte) bool {
 
 // logReceivedData 记录数据消息接收日志
 func (s *SecsGem) logReceivedData(msg *Message) {
-	rawFrame := msg.RawFrame
-	s.logger.Info("<<< Recv S%dF%d(W=%v, SysBytes=%d)\n%s\n%s", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes, FormatHexData(rawFrame), FormatSMLWithCodec(msg.Item, s.itemCodec))
+	s.logger.Info("<<< Recv %v", s.msgFormatter(msg))
 }
 
 // sendDefaultReply 发送默认回复 (上层未处理时)

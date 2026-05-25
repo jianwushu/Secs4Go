@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultServerAddress       = "127.0.0.1:7000"
+	defaultServerAddress       = "127.0.0.1:5000"
 	defaultClientT3            = 10 * time.Second
 	defaultClientItemAEncoding = "GBK"
 )
@@ -28,7 +28,7 @@ type clientOptions struct {
 func defaultClientOptions() clientOptions {
 	return clientOptions{
 		Address:         defaultServerAddress,
-		DeviceID:        1,
+		DeviceID:        0,
 		T3:              defaultClientT3,
 		ItemAEncoding:   defaultClientItemAEncoding,
 		EnableHeartbeat: true,

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/jianwushu/Secs4go/example/sharedcfg"
+	"github.com/jianwushu/Secs4go/sec4go.extension/sml"
 	"github.com/jianwushu/Secs4go/secs4go"
 )
 
@@ -37,6 +38,7 @@ func NewServerApp(opts serverOptions) (*ServerApp, error) {
 
 	logger := secs4go.NewFileLoggerWithLevel("Host", sharedcfg.ParseLogLevel(opts.LogLevel))
 	server := secs4go.NewSecsGem("Host", config, codec)
+	server.WithMessageFormatter(sml.ToSMLWithHex)
 	server.BindTransport(transport, logger)
 
 	app := &ServerApp{
