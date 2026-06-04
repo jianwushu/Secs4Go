@@ -79,10 +79,18 @@ func (app *ClientApp) handleMessage(msg *secs4go.Message) {
 	case "S6F11":
 		log.Printf("收到 S6F11, 发送 S6F12 回复")
 		reply := secs4go.NewMessage(6, 12).WithItem(secs4go.B(0))
+
 		if err := app.client.SendReply(msg, reply); err != nil {
 			log.Printf("发送 S6F12 失败: %v", err)
 		}
-		// log.Printf("SML: %s", sml.ToSML(msg))
+
+		s10f4, _ := app.client.Send(secs4go.NewMessage(10, 3).WithWBit(true).WithItem(
+			secs4go.L(
+				secs4go.B(0),
+				secs4go.A("123"),
+			),
+		))
+		log.Printf("SML: %s", sml.ToSML(s10f4))
 	default:
 		app.client.SendDefaultReply(msg)
 	}

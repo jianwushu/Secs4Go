@@ -342,14 +342,21 @@ func (s *SecsGem) handleDataMessage(header HSMSHeader, itemData []byte) {
 		}
 	}
 
-	// 主消息：向上层回调
+	// 主消息：向上层回调。
+	//
+	// 注意：这里必须将业务回调与 HSMSTransport.receiveLoop 解耦。
+	// receiveLoop 是连接的唯一读者，若同步执行 handler，而 handler 内又调用 Send(WBit=true)
+	// 等待回复，则 receiveLoop 无法继续读取对方回复并投递到 pendingReplies，最终会卡到 T3 超时。
+	//
+	// 库层只保证 I/O 接收泵不被业务阻塞，不承诺不同主消息业务回调的串并行完成顺序；
+	// 如需消息 A/B 串行处理，应由业务侧自行使用队列、锁或状态机控制。
 	s.mu.RLock()
 	handler := s.msgHandler
 	s.mu.RUnlock()
 
-	// 使用复制后的handler
+	// 使用复制后的 handler，在独立 goroutine 中执行，避免阻塞接收泵。
 	if handler != nil {
-		handler(msg)
+		go handler(msg)
 	}
 }
 
