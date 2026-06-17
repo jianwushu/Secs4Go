@@ -1,6 +1,6 @@
 package main
 
-import "github.com/jianwushu/Secs4go/secs4go"
+import secs4go "github.com/jianwushu/secs4go/core"
 
 // DACK 常量：S2F34 Define Report Acknowledge
 const (

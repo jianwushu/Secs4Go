@@ -1,4 +1,4 @@
-package secs4go
+package core
 
 import "fmt"
 
@@ -114,3 +114,14 @@ func (s ConnectionState) String() string {
 
 // StateChangeHandler 状态变更事件处理器
 type StateChangeHandler func(oldState, newState ConnectionState)
+
+// ============================================================
+// Channel 消息类型
+// ============================================================
+
+// DataMessage 数据消息（传输层→应用层）
+// receiveLoop 读取后通过 channel 分发给 dataMessageConsumer
+type DataMessage struct {
+	Header   HSMSHeader
+	ItemData []byte
+}

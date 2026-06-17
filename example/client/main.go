@@ -4,13 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/jianwushu/Secs4go/example/sharedcfg"
-	"github.com/jianwushu/Secs4go/extension/sml"
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
+	"github.com/jianwushu/secs4go/example/sharedcfg"
+	"github.com/jianwushu/secs4go/extension/sml"
 )
 
 // main 是 SECS/GEM 客户端（Host）示例入口
@@ -77,12 +79,19 @@ func (app *ClientApp) handleMessage(msg *secs4go.Message) {
 			log.Printf("发送 S1F2 失败: %v", err)
 		}
 	case "S6F11":
-		log.Printf("收到 S6F11, 发送 S6F12 回复")
-		reply := secs4go.NewMessage(6, 12).WithItem(secs4go.B(0))
+		// 模拟随机延时 (0-2000ms)
+		delay := time.Duration(rand.Intn(2001)) * time.Millisecond
+		log.Printf("收到 S6F11, 延时 %v 后发送 S6F12 回复", delay)
+		time.Sleep(delay)
 
+		reply := secs4go.NewMessage(6, 12).WithItem(secs4go.B(0))
 		if err := app.client.SendReply(msg, reply); err != nil {
 			log.Printf("发送 S6F12 失败: %v", err)
 		}
+
+		delay = time.Duration(rand.Intn(2001)) * time.Millisecond
+		log.Printf("任务延时 %v ", delay)
+		time.Sleep(delay)
 
 		item := msg.Item.GetItem(2).GetItem(0).GetItem(1).GetItem(0)
 		val, _ := item.FirstBool()

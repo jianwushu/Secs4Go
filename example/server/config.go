@@ -6,14 +6,14 @@ import (
 	"io"
 	"time"
 
-	"github.com/jianwushu/Secs4go/example/sharedcfg"
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
+	"github.com/jianwushu/secs4go/example/sharedcfg"
 )
 
 const (
 	defaultListenAddress       = ":5000"
 	defaultServerT3            = 10 * time.Second
-	defaultEventInterval       = 2 * time.Second
+	defaultEventInterval       = 100 * time.Millisecond
 	defaultEventInitialDelay   = 1 * time.Second
 	defaultSelectedPoll        = 500 * time.Millisecond
 	defaultServerItemAEncoding = "GBK"

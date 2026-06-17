@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jianwushu/Secs4go/example/sharedcfg"
-	"github.com/jianwushu/Secs4go/extension/sml"
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
+	"github.com/jianwushu/secs4go/extension/sml"
+	"github.com/jianwushu/secs4go/example/sharedcfg"
 )
 
 // SecsServer SECS-I/GEM服务端示例

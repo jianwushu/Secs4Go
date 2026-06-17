@@ -1,4 +1,4 @@
-module github.com/jianwushu/Secs4go
+module github.com/jianwushu/secs4go
 
 go 1.24.4
 

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 func NormalizeAddress(address string) (string, error) {

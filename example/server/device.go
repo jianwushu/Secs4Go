@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 // deviceMu 保护共享设备状态 map 的并发读写

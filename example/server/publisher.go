@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/jianwushu/Secs4go/secs4go"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 type eventPublisher struct {

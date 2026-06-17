@@ -1,4 +1,4 @@
-package secs4go
+package core
 
 import (
 	"encoding/binary"
@@ -16,14 +16,21 @@ import (
 // ============================================================
 
 var (
-	ErrNotConnected = errors.New("not connected")
-	ErrTimeoutT6    = errors.New("T6 control transaction timeout")
+	ErrNotConnected     = errors.New("not connected")
+	ErrTimeoutT6        = errors.New("T6 control transaction timeout")
+	ErrTransportStopped = errors.New("transport stopped")
 )
 
 // ============================================================
 // HSMSTransport 传输层
 // 职责: TCP连接管理、T5-T8超时控制、自动重连、心跳检测、控制会话处理
 // ============================================================
+
+// writeRequest 写请求（用于单写者模式）
+type writeRequest struct {
+	data  []byte     // 完整帧数据
+	errCh chan error // 结果回传通道
+}
 
 type HSMSTransport struct {
 	config *Config
@@ -38,11 +45,10 @@ type HSMSTransport struct {
 	listener net.Listener
 
 	// 超时控制
-	t6Timer *time.Timer // Control transaction (控制会话)
 	t7Timer *time.Timer // Not selected
 
-	// 消息信道
-	controlReplyChan chan struct{} // 控制回复信道 (T6)
+	// 控制事务关联（按 SystemBytes 匹配回复，替代原 controlReplyChan 单通道）
+	pendingControl sync.Map // map[uint32]chan HSMSHeader
 
 	// 连接生命周期（每次建立/断开连接都会轮转）
 	// ConnDone 在连接断开或 Stop/Close 时关闭，用于中断等待（T3/T6 等）
@@ -54,33 +60,31 @@ type HSMSTransport struct {
 	stopOnce      sync.Once
 	stopping      bool
 	reconnectChan chan struct{} // 重连信号通道
-	readyChan     chan struct{} // 就绪信号通道 (Select完成)
+	// 消息分发 Channel（控制/数据分离）
+	ctrlChan  chan HSMSHeader   // 控制消息通道
+	dataChan  chan DataMessage  // 数据消息通道
+	writeChan chan writeRequest // 写请求通道（单写者模式）
 
 	// 回调
-	ctrlHandler  func(HSMSHeader)         // 控制消息处理回调 (服务端)
 	stateHandler StateChangeHandler       // 状态变更回调
 	dataHandler  func(HSMSHeader, []byte) // 数据消息处理回调 (所有数据会话)
 
-	// SystemBytes 生成器
-	systemByte uint32
+	// 消息ID生成器（可自定义）
+	idGen MessageIdGenerator
 }
 
 // NewHSMSTransport 创建传输层
 func NewHSMSTransport(config *Config) *HSMSTransport {
-	// 初始为 disconnected：不预先塞一个“已关闭”的 connDone。
-	// 否则后续断连/Stop 时再次 close 会触发 panic: close of closed channel。
-	// 当 connDone == nil 时，ConnDone() 会返回一个临时的已关闭通道，供等待方立即退出。
 	return &HSMSTransport{
-		config:           config,
-		state:            StateDisconnected,
-		logger:           NewSilentLogger(),
-		t6Timer:          time.NewTimer(config.T6),
-		t7Timer:          time.NewTimer(config.T7),
-		controlReplyChan: make(chan struct{}, 1),
-		connDone:         nil,
-		stopChan:         make(chan struct{}),
-		reconnectChan:    make(chan struct{}, 1),
-		readyChan:        make(chan struct{}),
+		config:        config,
+		state:         StateDisconnected,
+		logger:        NewSilentLogger(),
+		idGen:         NewDefaultIdGenerator(),
+		t7Timer:       time.NewTimer(config.T7),
+		connDone:      nil,
+		stopChan:      make(chan struct{}),
+		reconnectChan: make(chan struct{}, 1),
+		writeChan:     make(chan writeRequest, 16),
 	}
 }
 
@@ -105,10 +109,19 @@ func (t *HSMSTransport) Start() error {
 	if t.state == StateDisconnected {
 		t.stopChan = make(chan struct{})
 		t.stopOnce = sync.Once{}
-		t.readyChan = make(chan struct{})
 		t.stopping = false
+		// 初始化消息分发 Channel
+		t.ctrlChan = make(chan HSMSHeader, 8)
+		t.dataChan = make(chan DataMessage, 64)
+		t.writeChan = make(chan writeRequest, 16)
 	}
 	t.mu.Unlock()
+
+	// 启动消息消费协程（控制/数据分离处理 + 单写者）
+	t.wg.Add(3)
+	go t.ctrlMessageConsumer()
+	go t.dataMessageConsumer()
+	go t.writeLoop()
 
 	if t.config.IsActive {
 		// 客户端模式: 连接并启动后台协程
@@ -186,6 +199,9 @@ func (t *HSMSTransport) Stop() {
 	// 先关闭底层资源以打断 Accept/read
 	t.closeResources()
 
+	// 排空消息通道，确保消费协程不被阻塞
+	t.drainChannels()
+
 	// 等待所有协程退出
 	t.wg.Wait()
 
@@ -200,11 +216,6 @@ func (t *HSMSTransport) Stop() {
 	}
 
 	t.logger.Info("Transport stopped")
-}
-
-// ReadyChan 返回就绪通道 (Select完成时发送信号)
-func (t *HSMSTransport) ReadyChan() <-chan struct{} {
-	return t.readyChan
 }
 
 // ConnDone 返回连接断开信号（连接断开 / Stop / Close 时关闭）
@@ -243,11 +254,6 @@ func (t *HSMSTransport) closeConnDoneLocked() {
 	})
 }
 
-// ReconnectChan 返回重连通道 (供外部触发重连)
-func (t *HSMSTransport) ReconnectChan() chan<- struct{} {
-	return t.reconnectChan
-}
-
 // autoReconnectLoop 自动重连循环
 func (t *HSMSTransport) autoReconnectLoop() {
 	defer t.wg.Done()
@@ -280,7 +286,8 @@ func (t *HSMSTransport) autoReconnectLoop() {
 				}
 
 				// 尝试重连
-				if err := t.reconnect(); err == nil {
+				t.handleDisconnect()
+				if err := t.Connect(t.config.Address); err == nil {
 					t.logger.Info("Reconnected successfully")
 					break
 				} else {
@@ -293,19 +300,6 @@ func (t *HSMSTransport) autoReconnectLoop() {
 			return
 		}
 	}
-}
-
-// reconnect 内部重连方法
-func (t *HSMSTransport) reconnect() error {
-	// 统一使用 handleDisconnect 处理断开和触发重连
-	t.handleDisconnect()
-
-	// 重新连接 (Connect 内部已包含 Select)
-	if err := t.Connect(t.config.Address); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // heartbeatLoop 心跳检测循环
@@ -336,14 +330,6 @@ func (t *HSMSTransport) heartbeatLoop() {
 		case <-t.stopChan:
 			return
 		}
-	}
-}
-
-// notifySelected 通知 Select 完成 (内部调用)
-func (t *HSMSTransport) notifySelected() {
-	select {
-	case t.readyChan <- struct{}{}:
-	default:
 	}
 }
 
@@ -378,11 +364,6 @@ func (t *HSMSTransport) Connect(address string) error {
 	header := BuildControlHeader(STypeSelectReq, t.NextSystemBytes(), 0)
 	if err := t.SendControlAndWait(header); err != nil {
 		return fmt.Errorf("select failed: %v", err)
-	}
-
-	// Select 成功后通知就绪
-	if t.IsSelected() {
-		t.notifySelected()
 	}
 
 	return nil
@@ -520,25 +501,49 @@ func (t *HSMSTransport) handleConnections() {
 // 数据发送
 // ============================================================
 
-// Send 发送原始字节数据 (用于已组装的完整帧)
-func (t *HSMSTransport) Send(data []byte) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+// ============================================================
+// 发送方法 - 通过 writeChan 串行化，消除并发写入竞态
+// ============================================================
 
-	if t.conn == nil {
+// enqueueWrite 将写请求入队并同步等待结果
+func (t *HSMSTransport) enqueueWrite(data []byte) error {
+	errCh := make(chan error, 1)
+	req := writeRequest{data: data, errCh: errCh}
+	select {
+	case t.writeChan <- req:
+		return <-errCh
+	case <-t.stopChan:
+		return ErrTransportStopped
+	case <-t.ConnDone():
 		return ErrNotConnected
 	}
-	t.conn.SetWriteDeadline(time.Now().Add(t.config.T8))
-	_, err := t.conn.Write(data)
-	return err
+}
+
+// Send 发送原始字节数据 (用于已组装的完整帧)
+func (t *HSMSTransport) Send(data []byte) error {
+	return t.enqueueWrite(data)
 }
 
 // NextSystemBytes 生成下一个 SystemBytes (导出供 SecsGem 使用)
+// 委托给 MessageIdGenerator，支持自定义策略
 func (t *HSMSTransport) NextSystemBytes() uint32 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.systemByte++
-	return t.systemByte
+	return t.idGen.Next()
+}
+
+// SetIdGenerator 设置自定义消息ID生成器
+// 可在 Start() 之前调用，替换默认的递增计数器
+//
+// 用法示例：
+//
+//	transport.SetIdGenerator(core.NewDefaultIdGenerator())
+//	transport.SetIdGenerator(core.IdGeneratorFunc(func() uint32 {
+//	    return customLogic()
+//	}))
+func (t *HSMSTransport) SetIdGenerator(gen MessageIdGenerator) {
+	if gen == nil {
+		return
+	}
+	t.idGen = gen
 }
 
 // ============================================================
@@ -547,21 +552,10 @@ func (t *HSMSTransport) NextSystemBytes() uint32 {
 
 // SendControl 发送控制消息
 func (t *HSMSTransport) SendControl(header HSMSHeader) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if t.conn == nil {
-		return ErrNotConnected
-	}
-
 	// 控制消息日志: 一行格式 (消息头 + 完整帧HEX)
-	frameData := BuildCompleteFrame(header, nil)
-
 	t.logSendControl(header)
-
-	t.conn.SetWriteDeadline(time.Now().Add(t.config.T8))
-	_, err := t.conn.Write(frameData)
-	return err
+	frameData := BuildCompleteFrame(header, nil)
+	return t.enqueueWrite(frameData)
 }
 
 // SendControlAndWait 发送控制消息并等待回复 (使用 T6)
@@ -571,18 +565,18 @@ func (t *HSMSTransport) SendControlAndWait(header HSMSHeader) error {
 		t.mu.RUnlock()
 		return ErrNotConnected
 	}
-
-	// T6: 启动 Control transaction 超时
-	if !t.t6Timer.Stop() {
-		select {
-		case <-t.t6Timer.C:
-		default:
-		}
-	}
-	t.t6Timer.Reset(t.config.T6)
 	t.mu.RUnlock()
 
-	// 发送控制消息
+	// T6: 创建事务级局部 Timer
+	timer := time.NewTimer(t.config.T6)
+	defer timer.Stop()
+
+	// 注册到 pendingControl（按 SystemBytes 关联回复）
+	replyCh := make(chan HSMSHeader, 1)
+	t.pendingControl.Store(header.SystemBytes, replyCh)
+	defer t.pendingControl.Delete(header.SystemBytes)
+
+	// 发送控制消息（通过 writeChan 串行化）
 	if err := t.SendControl(header); err != nil {
 		return err
 	}
@@ -593,9 +587,9 @@ func (t *HSMSTransport) SendControlAndWait(header HSMSHeader) error {
 		return ErrNotConnected
 	case <-t.ConnDone():
 		return ErrNotConnected
-	case <-t.t6Timer.C:
+	case <-timer.C:
 		return ErrTimeoutT6
-	case <-t.controlReplyChan:
+	case <-replyCh:
 		return nil
 	}
 }
@@ -619,14 +613,6 @@ func (t *HSMSTransport) SendSeparateReq() error {
 }
 
 // Reconnect 主动触发重连。
-//
-// 若当前已 Selected，先发送 Separate.req 通知服务端断开；
-// 随后立即关闭连接、重置状态，并触发自动重连流程（等 T5 后重新 Connect + Select）。
-//
-// 注意：
-//   - 仅在 AutoReconnect=true 时才会自动重新建立连接。
-//     若 AutoReconnect=false，可在 StateDisconnected 状态变更回调中手动调用 Start()。
-//   - 若传输层正在 Stop() 过程中，本方法为 no-op。
 func (t *HSMSTransport) Reconnect() {
 	if t.IsSelected() {
 		_ = t.SendSeparateReq()
@@ -677,8 +663,7 @@ func (t *HSMSTransport) LocalAddr() net.Addr {
 
 // closeResources 关闭底层资源（listener/conn/timers），不修改 state、不触发回调
 func (t *HSMSTransport) closeResources() {
-	// 停止所有定时器
-	t.t6Timer.Stop()
+	// 停止定时器
 	t.t7Timer.Stop()
 
 	// 取出资源引用，避免在持锁状态下做 Close() 阻塞
@@ -699,19 +684,11 @@ func (t *HSMSTransport) closeResources() {
 	}
 }
 
-// Close 关闭连接（资源关闭 + 状态置为 Disconnected；不触发回调）
-func (t *HSMSTransport) Close() {
-	t.mu.Lock()
-	t.state = StateDisconnected
-	t.mu.Unlock()
-	t.closeResources()
-}
-
 // ============================================================
 // 内部方法
 // ============================================================
 
-// receiveLoop 读取协程 - TCP读取 + 消息路由
+// receiveLoop 读取协程 - 只负责 TCP 读取和消息分发，不做业务处理
 func (t *HSMSTransport) receiveLoop() {
 	for {
 		t.mu.RLock()
@@ -732,23 +709,73 @@ func (t *HSMSTransport) receiveLoop() {
 		// T8: 设置读取超时
 		// conn.SetReadDeadline(time.Now().Add(t.config.T8))
 
-		header, itemData, err := ReadHSMSFrame(conn)
+		header, itemData, err := readHSMSFrame(conn)
 		if err != nil {
 			// 检查是否是 "use of closed network connection" 错误
 			// 这种错误发生在 Stop() 关闭连接后，receiveLoop 仍在读取的情况
 			if strings.Contains(err.Error(), "use of closed") {
 				return // 静默返回，避免不必要的错误日志
 			}
+
+			// 连接身份校验：检查当前 conn 是否已被替换（重连场景下旧协程的防御）
+			// 避免旧 receiveLoop 误伤新连接的 connDone/conn
+			t.mu.RLock()
+			currentConn := t.conn
+			t.mu.RUnlock()
+			if conn != currentConn {
+				return // 旧连接已被替换，静默退出
+			}
+
 			t.logger.Error(fmt.Sprintf("read error: %s", err))
 			t.handleDisconnect()
 			return
 		}
 
-		// 路由到处理方法
-		if header.SType == STypeDataMessage {
-			t.processDataMessage(header, itemData)
+		// 只做分发，不做处理
+		if header.IsDataMessage() {
+			select {
+			case t.dataChan <- DataMessage{Header: header, ItemData: itemData}:
+			case <-t.stopChan:
+				return
+			}
 		} else {
+			select {
+			case t.ctrlChan <- header:
+			case <-t.stopChan:
+				return
+			}
+		}
+	}
+}
+
+// ============================================================
+// 消息消费协程 - 控制/数据分离
+// ============================================================
+
+// ctrlMessageConsumer 控制消息消费协程 - 独立处理控制消息
+func (t *HSMSTransport) ctrlMessageConsumer() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case header := <-t.ctrlChan:
 			t.processControlMessage(header)
+		case <-t.stopChan:
+			return
+		}
+	}
+}
+
+// dataMessageConsumer 数据消息消费协程 - 独立处理数据消息
+func (t *HSMSTransport) dataMessageConsumer() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case msg := <-t.dataChan:
+			t.processDataMessage(msg.Header, msg.ItemData)
+		case <-t.stopChan:
+			return
 		}
 	}
 }
@@ -757,7 +784,7 @@ func (t *HSMSTransport) receiveLoop() {
 // 消息处理 - 统一入口
 // ============================================================
 
-// processDataMessage 处理数据消息 - 只做解析，路由到 secsgem 的回调
+// processDataMessage 处理数据消息 - 路由到 secsgem 的回调
 func (t *HSMSTransport) processDataMessage(header HSMSHeader, itemData []byte) {
 
 	// 路由到数据消息回调（所有数据会话由 secsgem 统一处理）
@@ -774,46 +801,65 @@ func (t *HSMSTransport) processControlMessage(header HSMSHeader) {
 	// 记录接收日志 (一行格式)
 	t.logReceivedControl(header)
 
-	// T6: 停止 Control transaction 超时
-	t.t6Timer.Stop()
-
 	// 内部处理控制消息
 	t.handleControlInternal(header)
 
-	// 通知控制回复信道
-	select {
-	case t.controlReplyChan <- struct{}{}:
-	default:
+	// 按 SystemBytes 查找并投递控制回复（仅非请求方发起的控制消息才匹配）
+	if ch, ok := t.pendingControl.Load(header.SystemBytes); ok {
+		select {
+		case ch.(chan HSMSHeader) <- header:
+		default:
+		}
+	}
+}
+
+// drainChannels 排空消息通道，避免 goroutine 泄漏
+func (t *HSMSTransport) drainChannels() {
+	// 排空 writeChan 中的待处理请求，回复错误
+	for {
+		select {
+		case req := <-t.writeChan:
+			req.errCh <- ErrTransportStopped
+		default:
+			goto drainOthers
+		}
+	}
+drainOthers:
+	// 关闭 writeChan 让 writeLoop 退出（range 会自动退出）
+	close(t.writeChan)
+	// 排空 ctrlChan 和 dataChan
+	for {
+		select {
+		case <-t.ctrlChan:
+		case <-t.dataChan:
+		default:
+			return
+		}
 	}
 }
 
 // ============================================================
-// 辅助方法 - 日志与默认回复
+// 写者协程 - 所有 conn.Write 操作的唯一执行点
 // ============================================================
 
-// logReceivedControl 记录控制消息接收日志 (一行格式)
-func (t *HSMSTransport) logReceivedControl(header HSMSHeader) {
-	frameData := BuildCompleteFrame(header, nil)
-	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, FormatHexData(frameData))
-}
+// writeLoop 单写者循环：从 writeChan 取请求，串行执行 SetWriteDeadline + Write
+func (t *HSMSTransport) writeLoop() {
+	defer t.wg.Done()
 
-// logReceivedControl 记录控制消息接收日志 (一行格式)
-func (t *HSMSTransport) logSendControl(header HSMSHeader) {
-	frameData := BuildCompleteFrame(header, nil)
-	t.logger.Info("<<< Send %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, FormatHexData(frameData))
-}
+	for req := range t.writeChan {
+		t.mu.RLock()
+		c := t.conn
+		t.mu.RUnlock()
 
-// FormatHexData 格式化16进制数据(每个字节用空格隔开)
-func FormatHexData(data []byte) string {
-	if len(data) == 0 {
-		return ""
+		if c == nil {
+			req.errCh <- ErrNotConnected
+			continue
+		}
+
+		c.SetWriteDeadline(time.Now().Add(t.config.T8))
+		_, err := c.Write(req.data)
+		req.errCh <- err
 	}
-
-	hex := make([]string, len(data))
-	for i, b := range data {
-		hex[i] = fmt.Sprintf("%02X", b)
-	}
-	return strings.Join(hex, " ")
 }
 
 // handleControlInternal 内部处理控制消息
@@ -829,7 +875,6 @@ func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 		t.mu.Unlock()
 		if header.HeaderByte3 == 0x00 {
 			t.notifyStateChange(prevState, StateSelected)
-			t.notifySelected()
 		}
 
 	case STypeSelectReq: // 服务端收到 Select.req
@@ -839,7 +884,6 @@ func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 		t.state = StateSelected
 		t.mu.Unlock()
 		t.notifyStateChange(prevState, StateSelected)
-		t.notifySelected()
 
 	case STypeDeselectRsp:
 		t.mu.Lock()
@@ -867,14 +911,6 @@ func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 
 	case STypeSeparateReq:
 		t.handleDisconnect()
-	}
-
-	// 调用应用层回调 (如果设置了)
-	t.mu.RLock()
-	handler := t.ctrlHandler
-	t.mu.RUnlock()
-	if handler != nil {
-		handler(header)
 	}
 }
 
@@ -935,21 +971,18 @@ func (t *HSMSTransport) handleDisconnect() {
 	}
 	prevState := t.state
 	t.state = StateDisconnected
-	// 关闭连接生命周期信号，确保等待立即退出
 	t.closeConnDoneLocked()
+
+	// 合并：在同一次 Lock 中取出 conn 引用并清空
+	conn := t.conn
+	t.conn = nil
 	t.mu.Unlock()
 
-	// 停止所有定时器
-	t.t6Timer.Stop()
 	t.t7Timer.Stop()
 
-	// 关闭连接
-	t.mu.Lock()
-	if t.conn != nil {
-		_ = t.conn.Close()
-		t.conn = nil
+	if conn != nil {
+		_ = conn.Close()
 	}
-	t.mu.Unlock()
 
 	// 通知状态变更（断开连接）
 	t.notifyStateChange(prevState, StateDisconnected)
@@ -973,13 +1006,6 @@ func (t *HSMSTransport) handleDisconnect() {
 // ============================================================
 // 服务端模式 - 控制会话处理
 // ============================================================
-
-// OnControl 设置控制消息处理回调（服务端用）
-func (t *HSMSTransport) OnControl(handler func(HSMSHeader)) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.ctrlHandler = handler
-}
 
 // OnStateChange 设置状态变更回调
 func (t *HSMSTransport) OnStateChange(handler StateChangeHandler) {
@@ -1008,11 +1034,38 @@ func (t *HSMSTransport) OnMessage(handler func(HSMSHeader, []byte)) {
 	t.dataHandler = handler
 }
 
-var ErrInvalidFrame = errors.New("invalid HSMS frame")
+// ============================================================
+// 辅助方法 - 日志与默认回复
+// ============================================================
 
-// ReadHSMSFrame 读取HSMS帧
+// logReceivedControl 记录控制消息接收日志 (一行格式)
+func (t *HSMSTransport) logReceivedControl(header HSMSHeader) {
+	frameData := BuildCompleteFrame(header, nil)
+	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(frameData))
+}
+
+// logSendControl 记录控制消息发送日志 (一行格式)
+func (t *HSMSTransport) logSendControl(header HSMSHeader) {
+	frameData := BuildCompleteFrame(header, nil)
+	t.logger.Info(">>> Send %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(frameData))
+}
+
+// FormatHexData 格式化16进制数据(每个字节用空格隔开)
+func formatHexData(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+
+	hex := make([]string, len(data))
+	for i, b := range data {
+		hex[i] = fmt.Sprintf("%02X", b)
+	}
+	return strings.Join(hex, " ")
+}
+
+// readHSMSFrame 读取HSMS帧
 // 返回: 头部(10字节), SECS-II数据(Item), 错误
-func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
+func readHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
 	// 读取4字节长度
 	lengthBuf := make([]byte, 4)
 	if _, err := io.ReadFull(reader, lengthBuf); err != nil {
@@ -1021,7 +1074,7 @@ func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
 
 	frameLen := binary.BigEndian.Uint32(lengthBuf)
 	if frameLen < HSMSHeaderLength {
-		return HSMSHeader{}, nil, ErrInvalidFrame
+		return HSMSHeader{}, nil, errors.New("invalid HSMS frame")
 	}
 
 	// 读取头部 + 数据

@@ -1,4 +1,4 @@
-package secs4go
+package core
 
 import (
 	"encoding/binary"

@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jianwushu/Secs4go/secs4go"
+	"github.com/jianwushu/secs4go/core"
+	secs4go "github.com/jianwushu/secs4go/core"
 )
 
 // ToSML 将 SECS 消息转换为 SML 格式字符串
@@ -58,12 +59,9 @@ func formatItem(item *secs4go.Item, indent int) string {
 	indentStr := strings.Repeat("  ", indent)
 
 	switch item.Type {
-	case secs4go.TypeList:
+	case core.TypeList:
 		children, ok := item.Value.([]*secs4go.Item)
-		if !ok {
-			return fmt.Sprintf("%s<invalid list>", indentStr)
-		}
-		if len(children) == 0 {
+		if !ok || len(children) == 0 {
 			return fmt.Sprintf("%s<L[0]>", indentStr)
 		}
 		childParts := make([]string, len(children))
@@ -71,9 +69,9 @@ func formatItem(item *secs4go.Item, indent int) string {
 			childParts[i] = formatItem(child, indent+1)
 		}
 		return fmt.Sprintf("%s<L[%d]\n%s\n%s>", indentStr, len(children), strings.Join(childParts, "\n"), indentStr)
-	case secs4go.TypeBinary:
+	case core.TypeBinary:
 		return fmt.Sprintf("%s<B[%d] %s>", indentStr, len(item.Value.([]byte)), formatHexData(item.Value.([]byte)))
-	case secs4go.TypeBoolean:
+	case core.TypeBoolean:
 		bools, ok := item.Value.([]bool)
 		if !ok || len(bools) == 0 {
 			return fmt.Sprintf("%s<BOOLEAN[0]>", indentStr)

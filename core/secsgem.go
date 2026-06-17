@@ -1,4 +1,4 @@
-package secs4go
+package core
 
 import (
 	"errors"
@@ -182,6 +182,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 构建 HSMSHeader
 	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, transport.NextSystemBytes())
 	frameData := BuildCompleteFrame(header, itemData)
+	msg.SystemBytes = header.SystemBytes
 	msg.RawFrame = frameData
 
 	// 日志
@@ -245,6 +246,7 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	// 使用原消息的 SystemBytes
 	header := BuildDataHeader(s.config.DeviceID, reply.Stream, reply.Function, false, origMsg.SystemBytes)
 	frameData := BuildCompleteFrame(header, itemData)
+	reply.SystemBytes = origMsg.SystemBytes
 	reply.RawFrame = frameData
 
 	// 日志
