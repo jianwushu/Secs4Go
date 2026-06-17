@@ -1,10 +1,8 @@
 package core
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync"
@@ -45,18 +43,17 @@ type HSMSTransport struct {
 	listener net.Listener
 
 	// 超时控制
-	t7Timer *time.Timer // Not selected
+	t7Start  chan struct{}
+	t7Cancel chan struct{}
 
-	// 控制事务关联（按 SystemBytes 匹配回复，替代原 controlReplyChan 单通道）
 	pendingControl sync.Map // map[uint32]chan HSMSHeader
 
 	// 连接生命周期（每次建立/断开连接都会轮转）
-	// ConnDone 在连接断开或 Stop/Close 时关闭，用于中断等待（T3/T6 等）
 	connDone     chan struct{}
 	connDoneOnce sync.Once
 
 	// 生命周期控制
-	stopChan      chan struct{} // 停止信号通道（每次 Start/Stop 生命周期都会重建）
+	stopChan      chan struct{} // 停止信号通道
 	stopOnce      sync.Once
 	stopping      bool
 	reconnectChan chan struct{} // 重连信号通道
@@ -80,7 +77,6 @@ func NewHSMSTransport(config *Config) *HSMSTransport {
 		state:         StateDisconnected,
 		logger:        NewSilentLogger(),
 		idGen:         NewDefaultIdGenerator(),
-		t7Timer:       time.NewTimer(config.T7),
 		connDone:      nil,
 		stopChan:      make(chan struct{}),
 		reconnectChan: make(chan struct{}, 1),
@@ -105,6 +101,7 @@ func (t *HSMSTransport) Start() error {
 	}
 
 	// 新一轮生命周期初始化（支持 Stop() 后再次 Start()）
+	needStart := false
 	t.mu.Lock()
 	if t.state == StateDisconnected {
 		t.stopChan = make(chan struct{})
@@ -114,11 +111,21 @@ func (t *HSMSTransport) Start() error {
 		t.ctrlChan = make(chan HSMSHeader, 8)
 		t.dataChan = make(chan DataMessage, 64)
 		t.writeChan = make(chan writeRequest, 16)
+		// T7 信号通道（每次生命周期重建）
+		t.t7Start = make(chan struct{}, 1)
+		t.t7Cancel = make(chan struct{}, 1)
+		needStart = true
 	}
 	t.mu.Unlock()
 
-	// 启动消息消费协程（控制/数据分离处理 + 单写者）
-	t.wg.Add(3)
+	// 仅在首次初始化时启动消费协程，防止重复 Start 导致 goroutine 泄漏
+	if !needStart {
+		return nil
+	}
+
+	// 启动消息消费协程（控制/数据分离处理 + 单写者）+ T7 监控
+	t.wg.Add(4)
+	go t.t7MonitorLoop()
 	go t.ctrlMessageConsumer()
 	go t.dataMessageConsumer()
 	go t.writeLoop()
@@ -232,7 +239,6 @@ func (t *HSMSTransport) ConnDone() <-chan struct{} {
 
 // resetConnDoneLocked 重建连接生命周期通道（必须在持锁状态下调用）
 func (t *HSMSTransport) resetConnDoneLocked() {
-	// 先关闭旧的（如果还没关闭），避免遗留等待
 	if t.connDone != nil {
 		t.closeConnDoneLocked()
 	}
@@ -242,10 +248,6 @@ func (t *HSMSTransport) resetConnDoneLocked() {
 
 // closeConnDoneLocked 关闭连接生命周期通道（必须在持锁状态下调用）
 func (t *HSMSTransport) closeConnDoneLocked() {
-	// connDone == nil 表示当前没有可用的连接生命周期通道。
-	// ConnDone() 在 nil 时会返回一个“已关闭”的临时通道，因此这里无需创建/关闭新通道。
-	// 否则会出现：t.connDone 被赋值为“已关闭通道”，但 connDoneOnce 尚未标记执行，
-	// 后续再次 closeConnDoneLocked() 会二次 close 触发 panic。
 	if t.connDone == nil {
 		return
 	}
@@ -314,6 +316,7 @@ func (t *HSMSTransport) heartbeatLoop() {
 			// 检查是否已停止
 			select {
 			case <-t.stopChan:
+				heartbeatTimer.Stop()
 				return
 			default:
 			}
@@ -328,8 +331,74 @@ func (t *HSMSTransport) heartbeatLoop() {
 			}
 
 		case <-t.stopChan:
+			heartbeatTimer.Stop()
 			return
 		}
+	}
+}
+
+// ============================================================
+// T7 (Not Selected) 超时监控
+// ============================================================
+
+func (t *HSMSTransport) t7MonitorLoop() {
+	defer t.wg.Done()
+
+	timer := time.NewTimer(t.config.T7)
+	timer.Stop() // 初始未激活
+	active := false
+
+	for {
+		select {
+		case <-t.stopChan:
+			timer.Stop()
+			return
+
+		case <-t.t7Start:
+			// (重新)启动 T7：先 drain 旧触发，再 Reset
+			if active && !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(t.config.T7)
+			active = true
+
+		case <-t.t7Cancel:
+			// 取消 T7（Select 成功）
+			if active && !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			active = false
+
+		case <-timer.C:
+			// T7 超时：仅当处于「已连接未 Selected」时才断开
+			active = false
+			if t.GetState() == StateConnected {
+				t.logger.Warn("T7 timeout: connection not selected within %v", t.config.T7)
+				t.handleDisconnect()
+			}
+		}
+	}
+}
+
+// signalT7Start 非阻塞通知 T7 monitor (重新)启动计时
+func (t *HSMSTransport) signalT7Start() {
+	select {
+	case t.t7Start <- struct{}{}:
+	default:
+	}
+}
+
+// signalT7Cancel 非阻塞通知 T7 monitor 取消计时
+func (t *HSMSTransport) signalT7Cancel() {
+	select {
+	case t.t7Cancel <- struct{}{}:
+	default:
 	}
 }
 
@@ -339,30 +408,50 @@ func (t *HSMSTransport) heartbeatLoop() {
 
 // Connect 客户端: 连接到服务端并发起 Select
 func (t *HSMSTransport) Connect(address string) error {
-	t.mu.Lock()
+	// 进入前先检查是否已停止（与 Stop 竞态防护 #1）
+	select {
+	case <-t.stopChan:
+		return ErrTransportStopped
+	default:
+	}
 
-	// T5: 使用 T5 作为连接超时
 	conn, err := net.DialTimeout("tcp", address, t.config.T5)
 	if err != nil {
-		t.mu.Unlock()
 		return err
 	}
 
+	select {
+	case <-t.stopChan:
+		_ = conn.Close()
+		return ErrTransportStopped
+	default:
+	}
+
+	t.mu.Lock()
 	t.conn = conn
 	// 新连接生命周期：重建 connDone（保持打开状态，断连时再关闭）
 	t.resetConnDoneLocked()
+	// 显式进入 Connected：保证后续 Select 失败时 handleDisconnect 的早退检查能通过并清理
+	prevState := t.state
+	t.state = StateConnected
+	t.mu.Unlock()
+
+	if prevState != StateConnected {
+		t.notifyStateChange(prevState, StateConnected)
+	}
 
 	// T7: 启动 Not Selected 超时
-	t.resetT7Locked()
+	t.signalT7Start()
 
-	// 启动读取协程
+	// 启动读取协程（纳入 WaitGroup，Stop 可正确等待其退出）
+	t.wg.Add(1)
 	go t.receiveLoop()
-
-	t.mu.Unlock()
 
 	// 发起 Select 请求 (使用 T6)
 	header := BuildControlHeader(STypeSelectReq, t.NextSystemBytes(), 0)
 	if err := t.SendControlAndWait(header); err != nil {
+		// Select 失败：清理 conn 并让 receiveLoop 退出，避免旧协程与新连接并存
+		t.handleDisconnect()
 		return fmt.Errorf("select failed: %v", err)
 	}
 
@@ -397,7 +486,7 @@ func (t *HSMSTransport) Listen(address string) error {
 
 	prevState := t.state
 	t.listener = listener
-	t.conn = nil // 清空旧连接
+	t.conn = nil
 	t.state = StateListening
 	t.mu.Unlock()
 
@@ -439,9 +528,10 @@ func (t *HSMSTransport) Accept() error {
 	}
 
 	// T7: 启动 Not Selected 超时
-	t.resetT7()
+	t.signalT7Start()
 
-	// 启动读取协程
+	// 启动读取协程（纳入 WaitGroup）
+	t.wg.Add(1)
 	go t.receiveLoop()
 
 	return nil
@@ -501,10 +591,6 @@ func (t *HSMSTransport) handleConnections() {
 // 数据发送
 // ============================================================
 
-// ============================================================
-// 发送方法 - 通过 writeChan 串行化，消除并发写入竞态
-// ============================================================
-
 // enqueueWrite 将写请求入队并同步等待结果
 func (t *HSMSTransport) enqueueWrite(data []byte) error {
 	errCh := make(chan error, 1)
@@ -524,21 +610,11 @@ func (t *HSMSTransport) Send(data []byte) error {
 	return t.enqueueWrite(data)
 }
 
-// NextSystemBytes 生成下一个 SystemBytes (导出供 SecsGem 使用)
-// 委托给 MessageIdGenerator，支持自定义策略
+// NextSystemBytes 生成下一个 SystemBytes
 func (t *HSMSTransport) NextSystemBytes() uint32 {
 	return t.idGen.Next()
 }
 
-// SetIdGenerator 设置自定义消息ID生成器
-// 可在 Start() 之前调用，替换默认的递增计数器
-//
-// 用法示例：
-//
-//	transport.SetIdGenerator(core.NewDefaultIdGenerator())
-//	transport.SetIdGenerator(core.IdGeneratorFunc(func() uint32 {
-//	    return customLogic()
-//	}))
 func (t *HSMSTransport) SetIdGenerator(gen MessageIdGenerator) {
 	if gen == nil {
 		return
@@ -553,8 +629,8 @@ func (t *HSMSTransport) SetIdGenerator(gen MessageIdGenerator) {
 // SendControl 发送控制消息
 func (t *HSMSTransport) SendControl(header HSMSHeader) error {
 	// 控制消息日志: 一行格式 (消息头 + 完整帧HEX)
-	t.logSendControl(header)
 	frameData := BuildCompleteFrame(header, nil)
+	t.logSendControl(header, frameData)
 	return t.enqueueWrite(frameData)
 }
 
@@ -584,7 +660,7 @@ func (t *HSMSTransport) SendControlAndWait(header HSMSHeader) error {
 	// 等待 T6 超时或回复
 	select {
 	case <-t.stopChan:
-		return ErrNotConnected
+		return ErrTransportStopped
 	case <-t.ConnDone():
 		return ErrNotConnected
 	case <-timer.C:
@@ -663,16 +739,13 @@ func (t *HSMSTransport) LocalAddr() net.Addr {
 
 // closeResources 关闭底层资源（listener/conn/timers），不修改 state、不触发回调
 func (t *HSMSTransport) closeResources() {
-	// 停止定时器
-	t.t7Timer.Stop()
-
 	// 取出资源引用，避免在持锁状态下做 Close() 阻塞
 	t.mu.Lock()
 	conn := t.conn
 	listener := t.listener
 	t.conn = nil
 	t.listener = nil
-	// 关闭连接生命周期信号，确保所有等待（T3/T6 等）立即退出
+
 	t.closeConnDoneLocked()
 	t.mu.Unlock()
 
@@ -690,6 +763,8 @@ func (t *HSMSTransport) closeResources() {
 
 // receiveLoop 读取协程 - 只负责 TCP 读取和消息分发，不做业务处理
 func (t *HSMSTransport) receiveLoop() {
+	defer t.wg.Done()
+
 	for {
 		t.mu.RLock()
 		conn := t.conn
@@ -706,19 +781,23 @@ func (t *HSMSTransport) receiveLoop() {
 		default:
 		}
 
-		// T8: 设置读取超时
-		// conn.SetReadDeadline(time.Now().Add(t.config.T8))
+		// T8: 设置字符间超时（检测半开连接/对端崩溃不发 FIN）
+		_ = conn.SetReadDeadline(time.Now().Add(t.config.T8))
 
-		header, itemData, err := readHSMSFrame(conn)
+		header, itemData, err := ReadHSMSFrame(conn)
 		if err != nil {
-			// 检查是否是 "use of closed network connection" 错误
-			// 这种错误发生在 Stop() 关闭连接后，receiveLoop 仍在读取的情况
 			if strings.Contains(err.Error(), "use of closed") {
 				return // 静默返回，避免不必要的错误日志
 			}
 
-			// 连接身份校验：检查当前 conn 是否已被替换（重连场景下旧协程的防御）
-			// 避免旧 receiveLoop 误伤新连接的 connDone/conn
+			// T8 超时：网络字符间超时，触发断连处理
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				t.logger.Warn("T8 timeout (network intercharacter): %v", err)
+				t.handleDisconnect()
+				return
+			}
+
 			t.mu.RLock()
 			currentConn := t.conn
 			t.mu.RUnlock()
@@ -866,39 +945,22 @@ func (t *HSMSTransport) writeLoop() {
 func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 	switch header.SType {
 	case STypeSelectRsp:
-		t.t7Timer.Stop()
-		t.mu.Lock()
-		prevState := t.state
 		if header.HeaderByte3 == 0x00 {
-			t.state = StateSelected
-		}
-		t.mu.Unlock()
-		if header.HeaderByte3 == 0x00 {
-			t.notifyStateChange(prevState, StateSelected)
+			t.transitionState(StateSelected)
+			t.signalT7Cancel()
 		}
 
 	case STypeSelectReq: // 服务端收到 Select.req
 		t.sendSelectRsp(header.SystemBytes, 0x00)
-		t.mu.Lock()
-		prevState := t.state
-		t.state = StateSelected
-		t.mu.Unlock()
-		t.notifyStateChange(prevState, StateSelected)
+		t.transitionState(StateSelected)
+		t.signalT7Cancel()
 
 	case STypeDeselectRsp:
-		t.mu.Lock()
-		prevState := t.state
-		t.state = StateConnected
-		t.mu.Unlock()
-		t.notifyStateChange(prevState, StateConnected)
+		t.transitionState(StateConnected)
 
 	case STypeDeselectReq: // 服务端收到 Deselect.req
 		t.sendDeselectRsp(header.SystemBytes, 0x00)
-		t.mu.Lock()
-		prevState := t.state
-		t.state = StateConnected
-		t.mu.Unlock()
-		t.notifyStateChange(prevState, StateConnected)
+		t.transitionState(StateConnected)
 
 	case STypeLinktestReq: // 自动回复 LinkTest.rsp
 		t.sendLinkTestRsp(header.SystemBytes)
@@ -932,23 +994,6 @@ func (t *HSMSTransport) sendDeselectRsp(systemBytes uint32, status byte) {
 	t.SendControl(header)
 }
 
-// resetT7 重置 T7 Not Selected 超时
-func (t *HSMSTransport) resetT7() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.resetT7Locked()
-}
-
-func (t *HSMSTransport) resetT7Locked() {
-	if !t.t7Timer.Stop() {
-		select {
-		case <-t.t7Timer.C:
-		default:
-		}
-	}
-	t.t7Timer.Reset(t.config.T7)
-}
-
 // handleDisconnect 处理断开连接
 func (t *HSMSTransport) handleDisconnect() {
 	// Stop() 过程中不做断开处理，避免重开监听/触发重连
@@ -969,6 +1014,15 @@ func (t *HSMSTransport) handleDisconnect() {
 		t.mu.Unlock()
 		return
 	}
+	// 防护: 如果 connDone 已关闭，说明另一协程已完成断连处理，避免重复执行
+	if t.connDone != nil {
+		select {
+		case <-t.connDone:
+			t.mu.Unlock()
+			return
+		default:
+		}
+	}
 	prevState := t.state
 	t.state = StateDisconnected
 	t.closeConnDoneLocked()
@@ -977,8 +1031,6 @@ func (t *HSMSTransport) handleDisconnect() {
 	conn := t.conn
 	t.conn = nil
 	t.mu.Unlock()
-
-	t.t7Timer.Stop()
 
 	if conn != nil {
 		_ = conn.Close()
@@ -1014,9 +1066,16 @@ func (t *HSMSTransport) OnStateChange(handler StateChangeHandler) {
 	t.stateHandler = handler
 }
 
+// transitionState 原子地转换连接状态并通知监听器（Lock → 读取旧状态 → 设置新状态 → Unlock → 通知）
+func (t *HSMSTransport) transitionState(newState ConnectionState) {
+	t.mu.Lock()
+	prevState := t.state
+	t.state = newState
+	t.mu.Unlock()
+	t.notifyStateChange(prevState, newState)
+}
+
 // notifyStateChange 通知状态变更
-// 注意：handler 在独立 goroutine 中执行，避免在 receiveLoop 内同步调用阻塞型操作
-// （例如 stateHandler 中调用 client.Send(S1F13) 需要 receiveLoop 读取回复，若同步调用则死锁）
 func (t *HSMSTransport) notifyStateChange(oldState, newState ConnectionState) {
 	t.mu.RLock()
 	handler := t.stateHandler
@@ -1040,58 +1099,36 @@ func (t *HSMSTransport) OnMessage(handler func(HSMSHeader, []byte)) {
 
 // logReceivedControl 记录控制消息接收日志 (一行格式)
 func (t *HSMSTransport) logReceivedControl(header HSMSHeader) {
-	frameData := BuildCompleteFrame(header, nil)
-	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(frameData))
+	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(header.RawFrame))
 }
 
 // logSendControl 记录控制消息发送日志 (一行格式)
-func (t *HSMSTransport) logSendControl(header HSMSHeader) {
-	frameData := BuildCompleteFrame(header, nil)
+func (t *HSMSTransport) logSendControl(header HSMSHeader, frameData []byte) {
 	t.logger.Info(">>> Send %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(frameData))
 }
 
-// FormatHexData 格式化16进制数据(每个字节用空格隔开)
+// hexTable 预计算的字节到十六进制字符串查找表，避免每次调用 fmt.Sprintf
+var hexTable [256]string
+
+func init() {
+	for i := 0; i < 256; i++ {
+		hexTable[i] = fmt.Sprintf("%02X", i)
+	}
+}
+
+// formatHexData 格式化16进制数据(每个字节用空格隔开)
 func formatHexData(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
 
-	hex := make([]string, len(data))
-	for i, b := range data {
-		hex[i] = fmt.Sprintf("%02X", b)
+	var sb strings.Builder
+	// 每个字节 "XX " 占3个字符
+	sb.Grow(len(data)*3 - 1)
+	sb.WriteString(hexTable[data[0]])
+	for _, b := range data[1:] {
+		sb.WriteByte(' ')
+		sb.WriteString(hexTable[b])
 	}
-	return strings.Join(hex, " ")
-}
-
-// readHSMSFrame 读取HSMS帧
-// 返回: 头部(10字节), SECS-II数据(Item), 错误
-func readHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
-	// 读取4字节长度
-	lengthBuf := make([]byte, 4)
-	if _, err := io.ReadFull(reader, lengthBuf); err != nil {
-		return HSMSHeader{}, nil, err
-	}
-
-	frameLen := binary.BigEndian.Uint32(lengthBuf)
-	if frameLen < HSMSHeaderLength {
-		return HSMSHeader{}, nil, errors.New("invalid HSMS frame")
-	}
-
-	// 读取头部 + 数据
-	dataLen := int(frameLen) - HSMSHeaderLength
-	frameData := make([]byte, frameLen)
-	if _, err := io.ReadFull(reader, frameData); err != nil {
-		return HSMSHeader{}, nil, err
-	}
-
-	// 解析头部
-	header := DecodeHeader(frameData[:HSMSHeaderLength])
-
-	// 提取SECS-II数据 (Item)
-	var itemData []byte
-	if dataLen > 0 {
-		itemData = frameData[HSMSHeaderLength:]
-	}
-
-	return header, itemData, nil
+	return sb.String()
 }

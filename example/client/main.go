@@ -81,7 +81,7 @@ func (app *ClientApp) handleMessage(msg *secs4go.Message) {
 	case "S6F11":
 		// 模拟随机延时 (0-2000ms)
 		delay := time.Duration(rand.Intn(2001)) * time.Millisecond
-		log.Printf("收到 S6F11, 延时 %v 后发送 S6F12 回复", delay)
+		app.logger.Warn("收到 S6F11, 延时 %v 后发送 S6F12 回复", delay)
 		time.Sleep(delay)
 
 		reply := secs4go.NewMessage(6, 12).WithItem(secs4go.B(0))
@@ -90,12 +90,12 @@ func (app *ClientApp) handleMessage(msg *secs4go.Message) {
 		}
 
 		delay = time.Duration(rand.Intn(2001)) * time.Millisecond
-		log.Printf("任务延时 %v ", delay)
+		app.logger.Warn("任务延时 %v ", delay)
 		time.Sleep(delay)
 
 		item := msg.Item.GetItem(2).GetItem(0).GetItem(1).GetItem(0)
 		val, _ := item.FirstBool()
-		log.Printf("item: %v", val)
+		app.logger.Warn("%v item: %v", msg.SystemBytes, val)
 
 	default:
 		app.client.SendDefaultReply(msg)

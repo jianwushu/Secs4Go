@@ -1,6 +1,10 @@
 package core
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"errors"
+	"io"
+)
 
 // ============================================================
 // HSMSHeader HSMS消息头 (10字节)
@@ -115,4 +119,37 @@ func (h *HSMSHeader) IsDataMessage() bool {
 // IsControlMessage 判断是否为控制消息
 func (h *HSMSHeader) IsControlMessage() bool {
 	return !h.IsDataMessage()
+}
+
+// readHSMSFrame 读取HSMS帧
+// 返回: 头部(10字节), SECS-II数据(Item), 错误
+func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
+	// 读取4字节长度
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(reader, lengthBuf); err != nil {
+		return HSMSHeader{}, nil, err
+	}
+
+	frameLen := binary.BigEndian.Uint32(lengthBuf)
+	if frameLen < HSMSHeaderLength {
+		return HSMSHeader{}, nil, errors.New("invalid HSMS frame")
+	}
+
+	// 读取头部 + 数据
+	dataLen := int(frameLen) - HSMSHeaderLength
+	frameData := make([]byte, frameLen)
+	if _, err := io.ReadFull(reader, frameData); err != nil {
+		return HSMSHeader{}, nil, err
+	}
+
+	// 解析头部
+	header := DecodeHeader(frameData[:HSMSHeaderLength])
+
+	// 提取SECS-II数据 (Item)
+	var itemData []byte
+	if dataLen > 0 {
+		itemData = frameData[HSMSHeaderLength:]
+	}
+
+	return header, itemData, nil
 }
