@@ -1,7 +1,7 @@
 package secs4go
 
 import (
-	"fmt"
+	"encoding/binary"
 	"time"
 )
 
@@ -48,59 +48,24 @@ func (m *Message) WithSystemBytes(sb uint32) *Message {
 	return m
 }
 
-// ============================================================
-// 消息格式化 (用于日志)
-// ============================================================
-
-// FormatMessage 格式化消息(用于日志)
-func FormatMessage(msg *Message) string {
-	if msg == nil {
-		return "nil"
-	}
-	return fmt.Sprintf("S%dF%d(W=%v, SysBytes=%d)", msg.Stream, msg.Function, msg.WBit, msg.SystemBytes)
-}
-
-func cloneBytes(data []byte) []byte {
-	if len(data) == 0 {
-		return nil
-	}
-	cloned := make([]byte, len(data))
-	copy(cloned, data)
-	return cloned
-}
-
-func (m *Message) applyProtocolSnapshot(header HSMSHeader, itemData []byte, frameData []byte, timestamp time.Time) {
-	if m == nil {
-		return
-	}
-	if timestamp.IsZero() {
-		timestamp = time.Now()
-	}
-
-	m.Stream = header.Stream()
-	m.WBit = header.WBit()
-	m.Function = header.Function()
-	m.SystemBytes = header.SystemBytes
-	m.RawFrame = cloneBytes(frameData)
-	m.Timestamp = timestamp
-}
-
 // ParseMessage HSMSHeader + []byte → Message
 // 从HSMSHeader提取S/F/WBit，解析Item
 func ParseMessage(header HSMSHeader, data []byte, codec *ItemCodec) (*Message, error) {
-	msg := &Message{}
-	msg.applyProtocolSnapshot(header, data, BuildCompleteFrame(header, data), time.Now())
+	msg := &Message{
+		Stream:      header.Stream(),
+		WBit:        header.WBit(),
+		Function:    header.Function(),
+		SystemBytes: header.SystemBytes,
+		RawFrame:    BuildCompleteFrame(header, data),
+		Timestamp:   time.Now(),
+	}
 
 	// 解析Item数据
 	if len(data) > 0 {
 		var item *Item
 		var err error
 
-		if codec != nil {
-			item, _, err = codec.DecodeItem(data)
-		} else {
-			item, _, err = DecodeItem(data)
-		}
+		item, _, err = codec.DecodeItem(data)
 
 		if err != nil {
 			return nil, err
@@ -109,4 +74,14 @@ func ParseMessage(header HSMSHeader, data []byte, codec *ItemCodec) (*Message, e
 	}
 
 	return msg, nil
+}
+
+// BuildCompleteFrame 格式化完整帧数据 (4B长度 + 10B头部 + 数据)
+func BuildCompleteFrame(header HSMSHeader, itemData []byte) []byte {
+	headerBytes := header.Encode()
+	lengthBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBuf, uint32(len(headerBytes)+len(itemData)))
+	frameBytes := append(lengthBuf, headerBytes...)
+	frameBytes = append(frameBytes, itemData...)
+	return frameBytes
 }

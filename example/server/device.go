@@ -97,7 +97,7 @@ var (
 	}
 )
 
-// parseUintIDs 从 List 类型 Item 中安全解析整数 ID 列表（支持 U2/U4/I2）
+// parseUintIDs 从 List 类型 Item 中安全解析整数 ID 列表（支持 U2/U4/I2 等跨类型）
 func parseUintIDs(item *secs4go.Item) []string {
 	if !item.IsList() {
 		return nil
@@ -108,21 +108,11 @@ func parseUintIDs(item *secs4go.Item) []string {
 		if child == nil {
 			continue
 		}
-		switch child.Type {
-		case secs4go.TypeUInt16:
-			if v, ok := child.Value.([]uint16); ok && len(v) > 0 {
-				ids = append(ids, fmt.Sprint(v[0]))
-			}
-		case secs4go.TypeUInt32:
-			if v, ok := child.Value.([]uint32); ok && len(v) > 0 {
-				ids = append(ids, fmt.Sprint(v[0]))
-			}
-		case secs4go.TypeInt16:
-			if v, ok := child.Value.([]int16); ok && len(v) > 0 {
-				ids = append(ids, fmt.Sprint(v[0]))
-			}
-		default:
-			ids = append(ids, fmt.Sprint(child.Value))
+		// 跨类型取第一个整数值
+		if v, ok := child.FirstInt(); ok {
+			ids = append(ids, fmt.Sprint(v))
+		} else {
+			ids = append(ids, child.Format())
 		}
 	}
 	return ids
@@ -133,35 +123,18 @@ func parseFirstUint(item *secs4go.Item) string {
 	if item == nil {
 		return ""
 	}
-	switch item.Type {
-	case secs4go.TypeUInt16:
-		if v, ok := item.Value.([]uint16); ok && len(v) > 0 {
-			return fmt.Sprint(v[0])
-		}
-	case secs4go.TypeUInt32:
-		if v, ok := item.Value.([]uint32); ok && len(v) > 0 {
-			return fmt.Sprint(v[0])
-		}
-	case secs4go.TypeInt16:
-		if v, ok := item.Value.([]int16); ok && len(v) > 0 {
-			return fmt.Sprint(v[0])
-		}
-	}
-	return fmt.Sprint(item.Value)
+	return item.Format()
 }
 
 func parseBoolFlag(item *secs4go.Item, fieldName string) (bool, error) {
 	if item == nil {
 		return false, fmt.Errorf("%s 缺失", fieldName)
 	}
-	boolVals, ok := item.Value.([]bool)
+	v, ok := item.FirstBool()
 	if !ok {
-		return false, fmt.Errorf("%s 类型错误: 期望 []bool, 实际 ItemType=%v ValueType=%T", fieldName, item.Type, item.Value)
+		return false, fmt.Errorf("%s 类型错误: 期望 BOOLEAN, 实际 ItemType=%v", fieldName, item.Type)
 	}
-	if len(boolVals) == 0 {
-		return false, fmt.Errorf("%s 类型错误: []bool 为空", fieldName)
-	}
-	return boolVals[0], nil
+	return v, nil
 }
 
 func parseIDListFromListItem(item *secs4go.Item, fieldName string) ([]string, error) {

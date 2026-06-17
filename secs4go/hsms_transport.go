@@ -1,8 +1,10 @@
 package secs4go
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -328,8 +330,6 @@ func (t *HSMSTransport) heartbeatLoop() {
 					t.logger.Error("Heartbeat failed: %v", err)
 					// 心跳失败时调用 handleDisconnect 触发重连
 					t.handleDisconnect()
-				} else {
-					t.logger.Debug("Heartbeat OK")
 				}
 			}
 
@@ -556,7 +556,8 @@ func (t *HSMSTransport) SendControl(header HSMSHeader) error {
 
 	// 控制消息日志: 一行格式 (消息头 + 完整帧HEX)
 	frameData := BuildCompleteFrame(header, nil)
-	t.logger.Info(">>> Send %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, FormatHexData(frameData))
+
+	t.logSendControl(header)
 
 	t.conn.SetWriteDeadline(time.Now().Add(t.config.T8))
 	_, err := t.conn.Write(frameData)
@@ -796,6 +797,25 @@ func (t *HSMSTransport) logReceivedControl(header HSMSHeader) {
 	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, FormatHexData(frameData))
 }
 
+// logReceivedControl 记录控制消息接收日志 (一行格式)
+func (t *HSMSTransport) logSendControl(header HSMSHeader) {
+	frameData := BuildCompleteFrame(header, nil)
+	t.logger.Info("<<< Send %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, FormatHexData(frameData))
+}
+
+// FormatHexData 格式化16进制数据(每个字节用空格隔开)
+func FormatHexData(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+
+	hex := make([]string, len(data))
+	for i, b := range data {
+		hex[i] = fmt.Sprintf("%02X", b)
+	}
+	return strings.Join(hex, " ")
+}
+
 // handleControlInternal 内部处理控制消息
 func (t *HSMSTransport) handleControlInternal(header HSMSHeader) {
 	switch header.SType {
@@ -986,4 +1006,39 @@ func (t *HSMSTransport) OnMessage(handler func(HSMSHeader, []byte)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.dataHandler = handler
+}
+
+var ErrInvalidFrame = errors.New("invalid HSMS frame")
+
+// ReadHSMSFrame 读取HSMS帧
+// 返回: 头部(10字节), SECS-II数据(Item), 错误
+func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
+	// 读取4字节长度
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(reader, lengthBuf); err != nil {
+		return HSMSHeader{}, nil, err
+	}
+
+	frameLen := binary.BigEndian.Uint32(lengthBuf)
+	if frameLen < HSMSHeaderLength {
+		return HSMSHeader{}, nil, ErrInvalidFrame
+	}
+
+	// 读取头部 + 数据
+	dataLen := int(frameLen) - HSMSHeaderLength
+	frameData := make([]byte, frameLen)
+	if _, err := io.ReadFull(reader, frameData); err != nil {
+		return HSMSHeader{}, nil, err
+	}
+
+	// 解析头部
+	header := DecodeHeader(frameData[:HSMSHeaderLength])
+
+	// 提取SECS-II数据 (Item)
+	var itemData []byte
+	if dataLen > 0 {
+		itemData = frameData[HSMSHeaderLength:]
+	}
+
+	return header, itemData, nil
 }

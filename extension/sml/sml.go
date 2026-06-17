@@ -74,7 +74,19 @@ func formatItem(item *secs4go.Item, indent int) string {
 	case secs4go.TypeBinary:
 		return fmt.Sprintf("%s<B[%d] %s>", indentStr, len(item.Value.([]byte)), formatHexData(item.Value.([]byte)))
 	case secs4go.TypeBoolean:
-		return fmt.Sprintf("%s<BOOLEAN %v>", indentStr, item.Value.(bool))
+		bools, ok := item.Value.([]bool)
+		if !ok || len(bools) == 0 {
+			return fmt.Sprintf("%s<BOOLEAN[0]>", indentStr)
+		}
+		parts := make([]string, len(bools))
+		for idx, b := range bools {
+			if b {
+				parts[idx] = "TRUE"
+			} else {
+				parts[idx] = "FALSE"
+			}
+		}
+		return fmt.Sprintf("%s<BOOLEAN[%d] %s>", indentStr, len(bools), strings.Join(parts, " "))
 	case secs4go.TypeASCII:
 		return fmt.Sprintf("%s<A[%d] \"%s\">", indentStr, len(item.Value.(string)), item.Value.(string))
 	case secs4go.TypeJIS8:

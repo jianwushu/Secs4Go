@@ -349,20 +349,6 @@ func (c *ItemCodec) decodeString(data []byte) (string, error) {
 }
 
 // ============================================================
-// 兼容性接口 (使用默认编解码器)
-// ============================================================
-
-// EncodeItem 编码Item (使用默认UTF-8/ASCII)
-func EncodeItem(item *Item) ([]byte, error) {
-	return DefaultItemCodec.EncodeItem(item)
-}
-
-// DecodeItem 解码Item (使用默认UTF-8/ASCII)
-func DecodeItem(data []byte) (*Item, int, error) {
-	return DefaultItemCodec.DecodeItem(data)
-}
-
-// ============================================================
 // Binary/ASCII/JIS8 编码/解码 (基础实现)
 // ============================================================
 
@@ -387,22 +373,21 @@ func encodeBoolean(value interface{}) ([]byte, error) {
 		return nil, ErrInvalidValue
 	}
 
-	// 每字节存储8个布尔值
-	result := make([]byte, (len(bools)+7)/8)
+	// SECS-II 规范: 每个布尔值占用一个字节，非零值为TRUE
+	result := make([]byte, len(bools))
 	for i, b := range bools {
 		if b {
-			result[i/8] |= 1 << (i % 8)
+			result[i] = 0x01
 		}
 	}
 	return result, nil
 }
 
 func decodeBoolean(data []byte) ([]bool, error) {
-	bools := make([]bool, len(data)*8)
+	// SECS-II 规范: 每个字节代表一个布尔值，非零值为TRUE
+	bools := make([]bool, len(data))
 	for i, b := range data {
-		for j := 0; j < 8 && i*8+j < len(bools); j++ {
-			bools[i*8+j] = (b & (1 << j)) != 0
-		}
+		bools[i] = b != 0
 	}
 	return bools, nil
 }

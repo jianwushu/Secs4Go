@@ -56,26 +56,23 @@ func (s *SecsGem) WithMessageFormatter(f MessageFormatter) *SecsGem {
 }
 
 // NewSecsGem 创建会话
-func NewSecsGem(deviceName string, config *Config, codec *ItemCodec) *SecsGem {
+func NewSecsGem(deviceName string, config *Config, codec *ItemCodec, logger Logger) *SecsGem {
 	if codec == nil {
 		codec = DefaultItemCodec
 	}
 	return &SecsGem{
 		deviceName: deviceName,
 		config:     config,
-		logger:     NewSilentLogger(),
+		logger:     logger,
 		itemCodec:  codec,
 		done:       make(chan struct{}),
 	}
 }
 
 // BindTransport 显式绑定 transport、logger 与消息回调
-func (s *SecsGem) BindTransport(transport *HSMSTransport, logger Logger) {
+func (s *SecsGem) BindTransport(transport *HSMSTransport) {
 	if s == nil {
 		return
-	}
-	if logger == nil {
-		logger = NewSilentLogger()
 	}
 
 	s.mu.Lock()
@@ -91,12 +88,11 @@ func (s *SecsGem) BindTransport(transport *HSMSTransport, logger Logger) {
 		s.transport.OnMessage(nil)
 	}
 	if transport != nil {
-		transport.logger = logger
+		transport.logger = s.logger
 		transport.OnMessage(s.handleDataMessage)
 	}
 
 	s.transport = transport
-	s.logger = logger
 }
 
 // UnbindTransport 显式解绑 transport 与消息回调
@@ -186,7 +182,7 @@ func (s *SecsGem) Send(msg *Message) (*Message, error) {
 	// 构建 HSMSHeader
 	header := BuildDataHeader(s.config.DeviceID, msg.Stream, msg.Function, msg.WBit, transport.NextSystemBytes())
 	frameData := BuildCompleteFrame(header, itemData)
-	msg.applyProtocolSnapshot(header, itemData, frameData, time.Now())
+	msg.RawFrame = frameData
 
 	// 日志
 	s.logger.Info(">>> Send %v", s.msgFormatter(msg))
@@ -249,7 +245,7 @@ func (s *SecsGem) SendReply(origMsg *Message, reply *Message) error {
 	// 使用原消息的 SystemBytes
 	header := BuildDataHeader(s.config.DeviceID, reply.Stream, reply.Function, false, origMsg.SystemBytes)
 	frameData := BuildCompleteFrame(header, itemData)
-	reply.applyProtocolSnapshot(header, itemData, frameData, time.Now())
+	reply.RawFrame = frameData
 
 	// 日志
 	s.logger.Info(">>> Send %v", s.msgFormatter(reply))
