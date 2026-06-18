@@ -883,7 +883,8 @@ func (t *HSMSTransport) processDataMessage(header HSMSHeader, itemData []byte) {
 // processControlMessage 处理控制消息 - 内部处理 + T6超时控制
 func (t *HSMSTransport) processControlMessage(header HSMSHeader) {
 	// 记录接收日志 (一行格式)
-	t.logReceivedControl(header)
+	frameData := BuildCompleteFrame(header, nil)
+	t.logReceivedControl(header, frameData)
 
 	// 内部处理控制消息
 	t.handleControlInternal(header)
@@ -1102,8 +1103,8 @@ func (t *HSMSTransport) OnMessage(handler func(HSMSHeader, []byte)) {
 // ============================================================
 
 // logReceivedControl 记录控制消息接收日志 (一行格式)
-func (t *HSMSTransport) logReceivedControl(header HSMSHeader) {
-	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(header.RawFrame))
+func (t *HSMSTransport) logReceivedControl(header HSMSHeader, frameData []byte) {
+	t.logger.Info("<<< Recv %s (SystemBytes=%d) HEX: %s", header.SType, header.SystemBytes, formatHexData(frameData))
 }
 
 // logSendControl 记录控制消息发送日志 (一行格式)

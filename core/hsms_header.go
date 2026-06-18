@@ -144,7 +144,6 @@ func ReadHSMSFrame(reader io.Reader) (HSMSHeader, []byte, error) {
 
 	// 解析头部
 	header := DecodeHeader(frameData[:HSMSHeaderLength])
-
 	// 提取SECS-II数据 (Item)
 	var itemData []byte
 	if dataLen > 0 {
