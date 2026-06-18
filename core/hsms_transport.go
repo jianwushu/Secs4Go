@@ -782,7 +782,7 @@ func (t *HSMSTransport) receiveLoop() {
 		}
 
 		// T8: 设置字符间超时（检测半开连接/对端崩溃不发 FIN）
-		_ = conn.SetReadDeadline(time.Now().Add(t.config.T8))
+		// _ = conn.SetReadDeadline(time.Now().Add(t.config.T8))
 
 		header, itemData, err := ReadHSMSFrame(conn)
 		if err != nil {
@@ -791,12 +791,12 @@ func (t *HSMSTransport) receiveLoop() {
 			}
 
 			// T8 超时：网络字符间超时，触发断连处理
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				t.logger.Warn("T8 timeout (network intercharacter): %v", err)
-				t.handleDisconnect()
-				return
-			}
+			// var netErr net.Error
+			// if errors.As(err, &netErr) && netErr.Timeout() {
+			// 	t.logger.Warn("T8 timeout (network intercharacter): %v", err)
+			// 	t.handleDisconnect()
+			// 	return
+			// }
 
 			t.mu.RLock()
 			currentConn := t.conn
@@ -821,6 +821,11 @@ func (t *HSMSTransport) receiveLoop() {
 			select {
 			case t.ctrlChan <- header:
 			case <-t.stopChan:
+				return
+			}
+			// Separate.req 是终端消息：对端发送后会关闭 TCP 连接，
+			// 继续读取必然产生 EOF 误报，直接退出即可。
+			if header.SType == STypeSeparateReq {
 				return
 			}
 		}
@@ -935,7 +940,7 @@ func (t *HSMSTransport) writeLoop() {
 			continue
 		}
 
-		c.SetWriteDeadline(time.Now().Add(t.config.T8))
+		// c.SetWriteDeadline(time.Now().Add(t.config.T8))
 		_, err := c.Write(req.data)
 		req.errCh <- err
 	}
@@ -996,7 +1001,6 @@ func (t *HSMSTransport) sendDeselectRsp(systemBytes uint32, status byte) {
 
 // handleDisconnect 处理断开连接
 func (t *HSMSTransport) handleDisconnect() {
-	// Stop() 过程中不做断开处理，避免重开监听/触发重连
 	t.mu.RLock()
 	stopping := t.stopping
 	t.mu.RUnlock()
